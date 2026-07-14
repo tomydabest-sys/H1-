@@ -12,7 +12,21 @@ The Becker archive lacked sufficient historical trade coverage for a proper Stag
 
 ## Phase 0 — Data backfill
 
-**Status: exploration/planning — no implementation until plan is approved.**
+**Status: implementation landed (plan approved 2026-07-14); offline test suite passes.
+Remaining for sign-off: live smoke run on both sides of the migration boundary +
+verification output — blocked on (a) network allowlist for `gamma-api.polymarket.com`
+and `polygon.hypersync.xyz` in this environment, (b) HyperSync API token.**
+
+Amendments vs. the original spec, surfaced during exploration (not silently resolved):
+- **Four exchanges, not two:** added V1 NegRisk (`0xC5d5…f80a`) and V2 NegRisk
+  (`0xe2222d…310F59`) — multi-outcome politics markets trade there.
+- **Two OrderFilled decoders:** V2's event has a different signature (explicit
+  `side` uint8 + single `tokenId` + builder/metadata bytes32s).
+- Added `ConditionResolution`/`ConditionPreparation` to the CTF event set —
+  the authoritative, leakage-safe resolution record.
+- Verify-at-smoke-run items flagged in `src/normalize/decode.py`: V2 side-mapping
+  direction (price-range check catches a flip), V2 collateral (pUSD/PMCT) decimals,
+  taker-aggregate row pattern per generation.
 
 - Goal: complete, deduplicated, resumable Parquet dataset of Polymarket politics-market trades and resolutions spanning both sides of the 2026-04-28 CLOB V2 migration.
 - Source: Envio HyperSync (`hypersync-client-python`, Polygon endpoint `https://polygon.hypersync.xyz`) streaming `OrderFilled` from both exchange generations:

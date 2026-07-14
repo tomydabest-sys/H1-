@@ -41,9 +41,27 @@ Phase-specific commands (backfill, verification reports) will be documented here
 | Phase | State |
 |---|---|
 | Scaffold | done |
-| Phase 0 — data backfill | planning (no implementation yet) |
+| Phase 0 — data backfill | code + offline tests done; live smoke run blocked on network allowlist + HyperSync token |
 | Phase 1 — calibration / fair value | not started |
 | Phase 2 — Stage 1 gate | not started; blocked on `PREREGISTRATION.md` tag |
+
+## Phase 0 pipeline
+
+Five resumable HyperSync streams (checkpointed part files under `data/raw/hypersync/`):
+four `OrderFilled` streams — **V1 CTF, V1 NegRisk, V2 CTF, V2 NegRisk** (the NegRisk
+exchanges carry the multi-outcome politics markets; V1 and V2 have different event
+signatures) — plus the Conditional Tokens contract for `ConditionPreparation` /
+`ConditionResolution` / `PositionSplit` / `PositionsMerge` / `PayoutRedemption`.
+Market metadata comes from Gamma's keyset-paginated `/markets/keyset` (dated snapshots
+under `data/raw/gamma/`, cursor-stall guard included). `scripts/build_curated.py`
+decodes both generations into one labeled-trade schema, dedups on `(tx_hash, log_index)`,
+and joins metadata; `scripts/verify_phase0.py` is the phase's pass/fail gate.
+
+### Network + credentials needed for live runs
+
+- Outbound HTTPS to `gamma-api.polymarket.com` and `polygon.hypersync.xyz`
+  (in Claude Code web sessions these must be on the environment's network allowlist).
+- `HYPERSYNC_BEARER_TOKEN` in `.env` (see `.env.example`) for the chain backfill.
 
 ## Survivorship-bias note
 

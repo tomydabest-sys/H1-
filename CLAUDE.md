@@ -15,7 +15,13 @@
 
 - `uv sync` — install/refresh the environment.
 - `uv run pytest` — run the test suite (schema checks, no-leakage checks, gate threshold checks).
-- Phase-specific verification commands are added here as each phase lands. None exist yet — Phase 0 is not implemented.
+
+### Phase 0 (data backfill)
+
+- `uv run python scripts/backfill_gamma.py` — pull a Gamma market-metadata snapshot (keyset pagination; resumable; no auth).
+- `uv run python scripts/backfill_chain.py --stream all [--to-block N]` — HyperSync backfill of the four OrderFilled streams + CTF events (resumable; requires `HYPERSYNC_BEARER_TOKEN` in `.env`, see `.env.example`).
+- `uv run python scripts/build_curated.py` — decode raw events, dedup, join metadata → `data/curated/`.
+- `uv run python scripts/verify_phase0.py` — Phase 0 verification report (pass/fail exit code).
 
 ## Kill criteria
 

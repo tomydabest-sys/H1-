@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Data: append-only local artifacts, never committed
+data/raw/**
+data/interim/**
+data/curated/**
+!data/raw/.gitkeep
+!data/interim/.gitkeep
+!data/curated/.gitkeep
+
+# Secrets (HyperSync API token etc.)
+.env

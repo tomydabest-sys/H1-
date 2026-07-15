@@ -12,10 +12,14 @@ The Becker archive lacked sufficient historical trade coverage for a proper Stag
 
 ## Phase 0 — Data backfill
 
-**Status: implementation landed (plan approved 2026-07-14); offline test suite passes.
-Remaining for sign-off: live smoke run on both sides of the migration boundary +
-verification output — blocked on (a) network allowlist for `gamma-api.polymarket.com`
-and `polygon.hypersync.xyz` in this environment, (b) HyperSync API token.**
+**Status: smoke run PASSED 2026-07-15 (verify_phase0 exit 0). Ingested: full Gamma
+metadata (1.71M closed + 60k open markets, 692k events) and the V2 exchanges from
+deployment through migration launch day (blocks 84,902,353–86,180,000: 6.69M fills,
+99.997% metadata-matched). Both decode assumptions verified — V2 side-mapping and
+6-decimal collateral match Polymarket's official data-api 100/100 on side/price/size.
+Remaining for phase completion: full historical backfill (V1 CTF + V1 NegRisk + V2
+both to tip + ctf_events) after sign-off, then re-verification incl. V1-side checks
+and the maker/taker aggregate-row cross-generation comparison.**
 
 Amendments vs. the original spec, surfaced during exploration (not silently resolved):
 - **Four exchanges, not two:** added V1 NegRisk (`0xC5d5…f80a`) and V2 NegRisk

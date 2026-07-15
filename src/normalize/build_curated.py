@@ -287,7 +287,10 @@ def build(data_root: Path) -> dict:
         set(resolutions["condition_id"].to_list()) if not resolutions.is_empty() else set()
     )
     markets = markets.with_columns(
-        cohort=pl.when(pl.col("condition_id").is_in(list(resolved_ids) or [""]))
+        cohort=pl.when(
+            (pl.col("condition_id") != "")  # empty ids must never match the fallback
+            & pl.col("condition_id").is_in(sorted(resolved_ids) or [""])
+        )
         .then(pl.lit("resolved_onchain"))
         .when(pl.col("closed"))
         .then(pl.lit("closed_unresolved"))

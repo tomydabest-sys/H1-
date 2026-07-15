@@ -99,10 +99,12 @@ def test_build_dedup_join_cohorts(data_root):
         markets=[
             gamma_market(1, COND_POLITICS, [TOKEN_POLITICS_YES, TOKEN_POLITICS_NO], event_id=11, closed=True),
             gamma_market(2, "0x" + "c2".rjust(64, "0"), [123, 124], event_id=22, closed=False),
+            dict(gamma_market(3, "", [321, 322], event_id=33, closed=True), conditionId=None),
         ],
         events=[
             gamma_event(11, ["us-politics"]),
             gamma_event(22, ["sports"]),
+            gamma_event(33, ["crypto"]),
         ],
     )
 
@@ -123,9 +125,11 @@ def test_build_dedup_join_cohorts(data_root):
     assert unlisted["is_politics"] is False
 
     markets = pl.read_parquet(data_root / "curated" / "markets.parquet").sort("market_id")
-    m1, m2 = markets.to_dicts()
+    m1, m2, m3 = markets.to_dicts()
     assert m1["cohort"] == "resolved_onchain"  # has on-chain ConditionResolution
     assert m2["cohort"] == "open"  # unresolved & not closed: survivorship cohort kept
+    # empty conditionId must never be classified resolved_onchain (regression)
+    assert m3["cohort"] == "closed_unresolved"
 
     res = pl.read_parquet(data_root / "curated" / "resolutions.parquet")
     assert res.to_dicts()[0]["payout_numerators"] == [1, 0]

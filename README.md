@@ -41,7 +41,7 @@ Phase-specific commands (backfill, verification reports) will be documented here
 | Phase | State |
 |---|---|
 | Scaffold | done |
-| Phase 0 — data backfill | code + offline tests done; live smoke run blocked on network allowlist + HyperSync token |
+| Phase 0 — data backfill | smoke run PASSED (V2 launch-day window, both flagged decode assumptions verified against the official feed); full historical backfill pending sign-off |
 | Phase 1 — calibration / fair value | not started |
 | Phase 2 — Stage 1 gate | not started; blocked on `PREREGISTRATION.md` tag |
 

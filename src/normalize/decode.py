@@ -12,17 +12,22 @@ V2 OrderFilled (10 params, explicit side):
     topics: 1=orderHash, 2=maker, 3=taker
     data words: 0=side (uint8, BUY=0/SELL=1), 1=tokenId, 2=makerAmountFilled,
                 3=takerAmountFilled, 4=fee, 5=builder (bytes32), 6=metadata (bytes32)
-    Mapping implemented as: side is the MAKER order's side; BUY ⇒ maker pays
-    collateral (makerAmountFilled) for tokenId (takerAmountFilled).
-    ⚠ VERIFY-AT-SMOKE-RUN: this maker-perspective reading must be confirmed
-    against real fills (all prices must land in (0,1); spot-check one tx on
-    Polygonscan). A flipped reading inverts prices, which the verification
-    script's price-range check would catch.
+    Mapping: side is the side of the order named in this row's maker field;
+    BUY ⇒ that order pays collateral (makerAmountFilled) for tokenId
+    (takerAmountFilled).
+    VERIFIED at the 2026-07-15 smoke run: (a) 100% of 5.7M post-cutover fills
+    price in (0,1); (b) within-tx structure is self-consistent — normal matches
+    pair opposite sides on one token at one price, mint/merge matches pair
+    same-side orders on complementary tokens with prices summing to 1.000;
+    (c) 100/100 recent fills matched Polymarket's official data-api on side,
+    price, and size exactly (the taker_is_exchange row is the official feed's
+    taker trade).
 
 Collateral units: V1 settles in USDC.e (6 decimals). V2 settles in the wrapped
-collateral introduced at the migration (pUSD/PMCT, a USDC wrapper — assumed
-6 decimals). ⚠ VERIFY-AT-SMOKE-RUN: the V2 collateral token's decimals() must
-be confirmed as 6 before trusting usd_notional on the V2 side.
+collateral introduced at the migration (pUSD/PMCT, a USDC wrapper).
+VERIFIED 6 decimals at the smoke run: sizes decoded at 1e6/share match the
+official data-api exactly (100/100), and notional distributions are
+dollar-plausible (median ~$3, p99 ~$418).
 
 Both rows of a match: each match emits one OrderFilled per maker order plus an
 aggregate row for the taker order, whose recorded counterparty is the exchange

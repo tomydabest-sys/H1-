@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,6 +28,10 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from ingest.contracts import CONFIRMATIONS, POLYGON_HYPERSYNC_URL, STREAMS, StreamSpec
+
+# Abort cleanly (checkpoint already saved) rather than fill the disk: a killed
+# run resumes, a full disk corrupts everything around it.
+MIN_FREE_BYTES = 5 * 1024**3
 
 RAW_SCHEMA = pa.schema(
     [
@@ -46,6 +51,10 @@ RAW_SCHEMA = pa.schema(
 
 class TokenMissingError(RuntimeError):
     pass
+
+
+class DiskSpaceError(RuntimeError):
+    """Free disk fell below MIN_FREE_BYTES; run is resumable from the checkpoint."""
 
 
 def _to_int(v: Any) -> int:
@@ -123,7 +132,9 @@ def write_part(sdir: Path, from_block: int, to_block: int, rows: list[dict]) -> 
     part = sdir / f"part-{from_block:010d}-{to_block:010d}.parquet"
     tmp = part.with_name(part.name + ".tmp")
     table = pa.Table.from_pylist(rows, schema=RAW_SCHEMA)
-    pq.write_table(table, tmp)
+    # zstd: constant columns (address/topic0) compress to ~nothing and hex text
+    # roughly halves vs snappy — matters at 10^8-event scale on a small disk.
+    pq.write_table(table, tmp, compression="zstd", compression_level=6)
     os.replace(tmp, part)
     return part
 
@@ -217,6 +228,11 @@ async def run_stream(
     query = _build_query(spec, start_block, end_inclusive + 1)
     batch = 0
     while True:
+        if shutil.disk_usage(sdir).free < MIN_FREE_BYTES:
+            raise DiskSpaceError(
+                f"[{spec.name}] free disk below {MIN_FREE_BYTES // 1024**3}GB at "
+                f"block {result.last_committed_block}; checkpoint saved — free space and re-run"
+            )
         res = await client.get(query)
         next_block = res.next_block  # first block NOT covered by this response
         covered_to = next_block - 1

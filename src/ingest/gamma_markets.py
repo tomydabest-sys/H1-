@@ -36,9 +36,19 @@ from tenacity import (
     wait_exponential_jitter,
 )
 
-GAMMA_KEYSET_URL = "https://gamma-api.polymarket.com/markets/keyset"
+GAMMA_BASE = "https://gamma-api.polymarket.com"
+# Both list endpoints paginate the same way. Note (live-verified 2026-07-15):
+# the keyset /markets payload does NOT embed tags/categories — those live on
+# /events/keyset (events carry `tags` + `category`; markets embed event ids) —
+# so politics classification requires BOTH snapshots.
+ENDPOINTS = {
+    "markets": f"{GAMMA_BASE}/markets/keyset",
+    "events": f"{GAMMA_BASE}/events/keyset",
+}
 PAGE_LIMIT = 100
 
+# Column is named market_id for historical reasons; for the events endpoint it
+# holds the event id. Readers should key off raw_json.
 PAGE_SCHEMA = pa.schema(
     [
         ("market_id", pa.string()),
@@ -61,9 +71,9 @@ def _utcnow() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def snapshot_dir(data_root: Path, snapshot: str | None = None) -> Path:
+def snapshot_dir(data_root: Path, snapshot: str | None = None, endpoint: str = "markets") -> Path:
     snap = snapshot or datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    return data_root / "raw" / "gamma" / "markets" / f"snapshot={snap}"
+    return data_root / "raw" / "gamma" / endpoint / f"snapshot={snap}"
 
 
 def _retryable(exc: BaseException) -> bool:
@@ -95,11 +105,11 @@ def _respect_retry_after(exc: BaseException) -> None:
     else None,
     reraise=True,
 )
-def _fetch_page(client: httpx.Client, after_cursor: str | None) -> dict:
+def _fetch_page(client: httpx.Client, url: str, after_cursor: str | None) -> dict:
     params: dict[str, Any] = {"limit": PAGE_LIMIT}
     if after_cursor:
         params["after_cursor"] = after_cursor
-    resp = client.get(GAMMA_KEYSET_URL, params=params, timeout=30.0)
+    resp = client.get(url, params=params, timeout=30.0)
     resp.raise_for_status()
     return {"json": resp.json()}
 
@@ -110,12 +120,12 @@ def parse_page(js: Any) -> tuple[list[dict], str | None]:
         return js, None  # bare list: single page, no cursor
     if isinstance(js, dict):
         items = None
-        for key in ("data", "markets", "results"):
+        for key in ("data", "markets", "events", "results"):
             if isinstance(js.get(key), list):
                 items = js[key]
                 break
         if items is None:
-            raise GammaShapeError(f"no market list under data/markets/results: keys={list(js)[:10]}")
+            raise GammaShapeError(f"no item list under data/markets/events/results: keys={list(js)[:10]}")
         cursor = js.get("next_cursor") or js.get("nextCursor") or None
         return items, cursor
     raise GammaShapeError(f"unexpected JSON type {type(js).__name__}")
@@ -165,11 +175,15 @@ def run_snapshot(
     snapshot: str | None = None,
     client: httpx.Client | None = None,
     max_pages: int | None = None,
+    endpoint: str = "markets",
 ) -> dict:
-    """Pull (or resume) one full market-metadata snapshot. Returns summary stats."""
+    """Pull (or resume) one full metadata snapshot (markets or events). Returns summary stats."""
+    if endpoint not in ENDPOINTS:
+        raise ValueError(f"endpoint must be one of {sorted(ENDPOINTS)}")
+    url = ENDPOINTS[endpoint]
     own_client = client is None
     client = client or httpx.Client(headers={"User-Agent": "h1-polymarket-research/0.1"})
-    sdir = snapshot_dir(data_root, snapshot)
+    sdir = snapshot_dir(data_root, snapshot, endpoint=endpoint)
     sdir.mkdir(parents=True, exist_ok=True)
 
     complete_marker = sdir / "_COMPLETE"
@@ -185,7 +199,7 @@ def run_snapshot(
     markets_written = 0
     try:
         while True:
-            js = _fetch_page(client, after_cursor)["json"]
+            js = _fetch_page(client, url, after_cursor)["json"]
             items, next_cursor = parse_page(js)
             if not items:
                 break
@@ -223,8 +237,8 @@ def run_snapshot(
             client.close()
 
 
-def latest_complete_snapshot(data_root: Path) -> Path | None:
-    root = data_root / "raw" / "gamma" / "markets"
+def latest_complete_snapshot(data_root: Path, endpoint: str = "markets") -> Path | None:
+    root = data_root / "raw" / "gamma" / endpoint
     if not root.exists():
         return None
     snaps = sorted(

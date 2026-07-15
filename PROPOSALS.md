@@ -27,6 +27,12 @@ Amendments vs. the original spec, surfaced during exploration (not silently reso
 - Verify-at-smoke-run items flagged in `src/normalize/decode.py`: V2 side-mapping
   direction (price-range check catches a flip), V2 collateral (pUSD/PMCT) decimals,
   taker-aggregate row pattern per generation.
+- **Live-data finding (2026-07-15):** the keyset `/markets` payload embeds events
+  *without* tags/categories (unlike the legacy endpoint). Tags now come from a
+  second snapshot of `/events/keyset` joined via embedded event ids — without it,
+  politics classification would silently return zero markets. The Gamma cursor-stall
+  bug (agents#227) did NOT reproduce; full markets snapshot paginated cleanly
+  (59,706 markets / 598 pages).
 
 - Goal: complete, deduplicated, resumable Parquet dataset of Polymarket politics-market trades and resolutions spanning both sides of the 2026-04-28 CLOB V2 migration.
 - Source: Envio HyperSync (`hypersync-client-python`, Polygon endpoint `https://polygon.hypersync.xyz`) streaming `OrderFilled` from both exchange generations:

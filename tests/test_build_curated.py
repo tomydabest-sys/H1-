@@ -17,7 +17,8 @@ TOKEN_UNLISTED = 999_888_777_666_555
 COND_POLITICS = "0x" + "c1".rjust(64, "0")
 
 
-def gamma_market(mid: int, condition_id: str, token_ids: list[int], tags: list[str], closed: bool) -> dict:
+def gamma_market(mid: int, condition_id: str, token_ids: list[int], event_id: int, closed: bool) -> dict:
+    # Mirrors the live keyset payload: the embedded event has an id but NO tags.
     return {
         "id": mid,
         "question": f"market {mid}?",
@@ -27,13 +28,17 @@ def gamma_market(mid: int, condition_id: str, token_ids: list[int], tags: list[s
         "closed": closed,
         "clobTokenIds": json.dumps([str(t) for t in token_ids]),
         "outcomes": json.dumps(["Yes", "No"]),
-        "events": [{"tags": [{"slug": t} for t in tags]}],
+        "events": [{"id": event_id, "slug": f"event-{event_id}"}],
         "negRisk": False,
     }
 
 
-def write_gamma_snapshot(data_root, markets: list[dict]) -> None:
-    sdir = data_root / "raw" / "gamma" / "markets" / "snapshot=2026-07-01"
+def gamma_event(eid: int, tags: list[str]) -> dict:
+    return {"id": eid, "title": f"event {eid}", "tags": [{"slug": t} for t in tags]}
+
+
+def _write_snapshot(data_root, endpoint: str, items: list[dict]) -> None:
+    sdir = data_root / "raw" / "gamma" / endpoint / "snapshot=2026-07-01"
     sdir.mkdir(parents=True)
     rows = [
         {
@@ -42,10 +47,15 @@ def write_gamma_snapshot(data_root, markets: list[dict]) -> None:
             "page_index": 0,
             "fetched_at": "2026-07-01T00:00:00Z",
         }
-        for m in markets
+        for m in items
     ]
     pq.write_table(pa.Table.from_pylist(rows), sdir / "page-00000.parquet")
     (sdir / "_COMPLETE").write_text("{}")
+
+
+def write_gamma_snapshot(data_root, markets: list[dict], events: list[dict]) -> None:
+    _write_snapshot(data_root, "markets", markets)
+    _write_snapshot(data_root, "events", events)
 
 
 def test_build_dedup_join_cohorts(data_root):
@@ -84,9 +94,13 @@ def test_build_dedup_join_cohorts(data_root):
     )
     write_gamma_snapshot(
         data_root,
-        [
-            gamma_market(1, COND_POLITICS, [TOKEN_POLITICS_YES, TOKEN_POLITICS_NO], ["us-politics"], closed=True),
-            gamma_market(2, "0x" + "c2".rjust(64, "0"), [123, 124], ["sports"], closed=False),
+        markets=[
+            gamma_market(1, COND_POLITICS, [TOKEN_POLITICS_YES, TOKEN_POLITICS_NO], event_id=11, closed=True),
+            gamma_market(2, "0x" + "c2".rjust(64, "0"), [123, 124], event_id=22, closed=False),
+        ],
+        events=[
+            gamma_event(11, ["us-politics"]),
+            gamma_event(22, ["sports"]),
         ],
     )
 
@@ -116,11 +130,10 @@ def test_build_dedup_join_cohorts(data_root):
 
 
 def test_politics_classification_rule():
-    m = extract_market_row(gamma_market(9, "0x" + "c9".rjust(64, "0"), [1, 2], ["geopolitics"], False))
-    assert m["is_politics"] is True
-    m2 = extract_market_row(gamma_market(9, "0x" + "c9".rjust(64, "0"), [1, 2], ["nba"], False))
-    assert m2["is_politics"] is False
-    m3 = extract_market_row(
-        dict(gamma_market(9, "0x" + "c9".rjust(64, "0"), [1, 2], [], False), category="US Elections")
-    )
-    assert m3["is_politics"] is True
+    mk = gamma_market(9, "0x" + "c9".rjust(64, "0"), [1, 2], event_id=11, closed=False)
+    # tags come from the events snapshot join, not the market payload
+    assert extract_market_row(mk, {"11": (None, ["geopolitics"])})["is_politics"] is True
+    assert extract_market_row(mk, {"11": (None, ["nba"])})["is_politics"] is False
+    assert extract_market_row(mk, {"11": ("US Elections", [])})["is_politics"] is True
+    # no events snapshot at all -> not politics, never a crash
+    assert extract_market_row(mk, None)["is_politics"] is False

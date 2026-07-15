@@ -79,7 +79,7 @@ def _parse_json_list(v) -> list:
     return []
 
 
-def extract_market_row(raw: dict) -> dict:
+def _collect_tags(raw: dict) -> set[str]:
     tags: set[str] = set()
     for ev in raw.get("events") or []:
         for t in ev.get("tags") or []:
@@ -93,13 +93,31 @@ def extract_market_row(raw: dict) -> dict:
                     tags.add(str(t[k]).lower())
         elif isinstance(t, str):
             tags.add(t.lower())
+    return tags
 
-    category = raw.get("category") or ""
-    text_pool = [category, *tags]
+
+def extract_market_row(raw: dict, event_tags: dict[str, tuple[str | None, list[str]]] | None = None) -> dict:
+    """Flatten one raw Gamma market. `event_tags` maps event id -> (category, tags)
+    from the events snapshot: the keyset /markets payload embeds events WITHOUT
+    their tags (live-verified 2026-07-15), so tags/categories must be joined in
+    from the /events/keyset snapshot.
+    """
+    tags = _collect_tags(raw)
+    categories = {str(raw.get("category") or "")}
+    event_ids = [str(ev.get("id", "")) for ev in raw.get("events") or []]
+    for eid in event_ids:
+        if event_tags and eid in event_tags:
+            ev_cat, ev_tags = event_tags[eid]
+            tags.update(ev_tags)
+            if ev_cat:
+                categories.add(ev_cat)
+
+    text_pool = [*categories, *tags]
     is_politics = any(POLITICS_PATTERNS.search(x) for x in text_pool if x)
 
     clob_ids = [str(x) for x in _parse_json_list(raw.get("clobTokenIds"))]
     outcomes = [str(x) for x in _parse_json_list(raw.get("outcomes"))]
+    category = next((c for c in categories if c), None)
 
     return {
         "market_id": str(raw.get("id", "")),
@@ -108,16 +126,32 @@ def extract_market_row(raw: dict) -> dict:
         "slug": raw.get("slug"),
         "created_at": raw.get("createdAt"),
         "closed": bool(raw.get("closed")),
+        "active": bool(raw.get("active", True)),
+        "archived": bool(raw.get("archived")),
         "closed_time": raw.get("closedTime"),
         "end_date": raw.get("endDate"),
-        "resolved_at_gamma": raw.get("resolvedAt"),
-        "category": category or None,
+        "category": category,
         "tags": sorted(tags),
+        "event_ids": event_ids,
         "neg_risk": bool(raw.get("negRisk")),
         "is_politics": is_politics,
         "clob_token_ids": clob_ids,
         "outcomes": outcomes,
     }
+
+
+def load_event_tags(data_root: Path) -> dict[str, tuple[str | None, list[str]]]:
+    """event id -> (category, [tag slugs/labels]) from the latest events snapshot."""
+    snap = latest_complete_snapshot(data_root, endpoint="events")
+    if snap is None:
+        return {}
+    pages = pl.read_parquet(sorted(snap.glob("page-*.parquet")))
+    out: dict[str, tuple[str | None, list[str]]] = {}
+    for raw_str in pages["raw_json"].to_list():
+        raw = json.loads(raw_str)
+        tags = sorted(_collect_tags({"tags": raw.get("tags")}))
+        out[str(raw.get("id", ""))] = (raw.get("category") or None, tags)
+    return out
 
 
 def load_markets(data_root: Path) -> pl.DataFrame:
@@ -126,8 +160,16 @@ def load_markets(data_root: Path) -> pl.DataFrame:
         raise FileNotFoundError(
             "no complete Gamma snapshot under data/raw/gamma/markets/ — run scripts/backfill_gamma.py first"
         )
+    event_tags = load_event_tags(data_root)
+    if not event_tags:
+        print(
+            "WARNING: no events snapshot found — tags/categories unavailable, "
+            "is_politics will be false everywhere. Run scripts/backfill_gamma.py --endpoint events"
+        )
     pages = pl.read_parquet(sorted(snap.glob("page-*.parquet")))
-    rows = [extract_market_row(json.loads(r)) for r in pages["raw_json"].to_list()]
+    rows = [
+        extract_market_row(json.loads(r), event_tags) for r in pages["raw_json"].to_list()
+    ]
     df = pl.DataFrame(rows).unique(subset=["market_id"], keep="last")
     return df
 

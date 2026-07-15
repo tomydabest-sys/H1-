@@ -89,6 +89,23 @@ def save_checkpoint(sdir: Path, last_committed_block: int) -> None:
     os.replace(tmp, f)
 
 
+def append_retention_segment(sdir: Path, mode: str, from_block: int, to_block: int) -> None:
+    """Record which block ranges hold full vs filtered raw (dataset definition)."""
+    f = sdir / "_retention.json"
+    doc = json.loads(f.read_text()) if f.exists() else {"segments": []}
+    doc["segments"].append(
+        {
+            "mode": mode,
+            "from_block": from_block,
+            "to_block": to_block,
+            "recorded_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+    )
+    tmp = f.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(doc, indent=1))
+    os.replace(tmp, f)
+
+
 def block_ts_map(blocks: list[Any]) -> dict[int, int]:
     out = {}
     for b in blocks:
@@ -199,9 +216,13 @@ async def run_stream(
     to_block: int | None = None,
     max_batches: int | None = None,
     log_every: int = 1,
+    row_filter: Any = None,
 ) -> RunResult:
     """Backfill one stream from its checkpoint (or deployment floor) to `to_block`
     (inclusive; default = chain tip minus CONFIRMATIONS). Injectable `client` for tests.
+
+    `row_filter(row) -> bool` drops rows before they are written (politics-only
+    retention); the run's covered range is recorded in `_retention.json`.
     """
     if client is None:
         client = make_client()
@@ -237,6 +258,8 @@ async def run_stream(
         next_block = res.next_block  # first block NOT covered by this response
         covered_to = next_block - 1
         rows = logs_to_rows(res.data.logs, block_ts_map(res.data.blocks))
+        if row_filter is not None:
+            rows = [r for r in rows if row_filter(r)]
         if rows:
             write_part(sdir, query.from_block, covered_to, rows)
             result.parts_written += 1
@@ -255,6 +278,13 @@ async def run_stream(
         if max_batches is not None and batch >= max_batches:
             break
         query.from_block = next_block
+    if result.last_committed_block >= result.from_block:
+        append_retention_segment(
+            sdir,
+            mode="full" if row_filter is None else "politics_only",
+            from_block=result.from_block,
+            to_block=result.last_committed_block,
+        )
     return result
 
 
@@ -263,11 +293,35 @@ async def run_streams(
     data_root: Path,
     to_block: int | None = None,
     client: Any = None,
+    politics_filter: bool = False,
 ) -> list[RunResult]:
+    filters_by_stream: dict[str, Any] = {}
+    if politics_filter:
+        from ingest.filters import ctf_row_filter, load_politics_sets, orderfilled_row_filter
+
+        markets_parquet = data_root / "curated" / "markets.parquet"
+        if not markets_parquet.exists():
+            raise FileNotFoundError(
+                "politics filter needs curated/markets.parquet — run scripts/build_curated.py first"
+            )
+        tokens, conditions = load_politics_sets(markets_parquet)
+        print(f"politics filter: {len(tokens):,} tokens, {len(conditions):,} conditions")
+        for name, spec in STREAMS.items():
+            if spec.generation is not None:
+                filters_by_stream[name] = orderfilled_row_filter(spec.generation, tokens)
+            else:
+                filters_by_stream[name] = ctf_row_filter(conditions)
+
     results = []
     for name in names:
         spec = STREAMS[name]
         results.append(
-            await run_stream(spec, data_root=data_root, client=client, to_block=to_block)
+            await run_stream(
+                spec,
+                data_root=data_root,
+                client=client,
+                to_block=to_block,
+                row_filter=filters_by_stream.get(name),
+            )
         )
     return results

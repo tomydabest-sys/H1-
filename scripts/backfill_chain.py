@@ -22,11 +22,22 @@ def main() -> None:
         help="stream name or 'all'",
     )
     ap.add_argument("--to-block", type=int, default=None, help="inclusive end block (default: tip minus confirmations)")
+    ap.add_argument(
+        "--politics-filter",
+        action="store_true",
+        help="retain only politics-market rows (dense-era disk constraint); "
+        "coverage recorded in each stream's _retention.json",
+    )
     args = ap.parse_args()
 
     names = list(STREAMS) if args.stream == "all" else [args.stream]
     results = asyncio.run(
-        run_streams(names, data_root=_bootstrap.DATA_ROOT, to_block=args.to_block)
+        run_streams(
+            names,
+            data_root=_bootstrap.DATA_ROOT,
+            to_block=args.to_block,
+            politics_filter=args.politics_filter,
+        )
     )
     for r in results:
         print(

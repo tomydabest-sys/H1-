@@ -21,6 +21,17 @@ Remaining for phase completion: full historical backfill (V1 CTF + V1 NegRisk + 
 both to tip + ctf_events) after sign-off, then re-verification incl. V1-side checks
 and the maker/taker aggregate-row cross-generation comparison.**
 
+**Retention decision (2026-07-15, flagged during the full backfill):** measured fill
+volume reaches 6–9.5M/day in 2026 (~1.2–1.4B events ≈ 90–105GB raw), ~5× this
+environment's disk. Since politics markets are 5.6% of fills and Phases 1–2 are
+politics-only analyses by design, raw retention is: **full all-markets through block
+75,370,715 (~Aug 2025) and for the V2 smoke range 84,902,353–86,180,000; politics-only
+(token/condition membership per the Gamma snapshots) beyond that, to the pinned end
+block 90,271,602.** ConditionPreparation/ConditionResolution are always kept in full.
+Nothing is destroyed — non-politics ranges remain re-pullable from HyperSync; each
+stream's `_retention.json` records exact coverage. Revisit with a larger environment
+if all-markets coverage is ever needed.
+
 Amendments vs. the original spec, surfaced during exploration (not silently resolved):
 - **Four exchanges, not two:** added V1 NegRisk (`0xC5d5…f80a`) and V2 NegRisk
   (`0xe2222d…310F59`) — multi-outcome politics markets trade there.

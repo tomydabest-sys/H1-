@@ -170,6 +170,26 @@ def load_event_tags(data_root: Path) -> dict[str, tuple[str | None, list[str]]]:
 
 MARKET_COHORT_ENDPOINTS = ("markets_open", "markets_closed")
 
+MARKET_SCHEMA: dict[str, pl.DataType] = {
+    "market_id": pl.Utf8,
+    "condition_id": pl.Utf8,
+    "question": pl.Utf8,
+    "slug": pl.Utf8,
+    "created_at": pl.Utf8,
+    "closed": pl.Boolean,
+    "active": pl.Boolean,
+    "archived": pl.Boolean,
+    "closed_time": pl.Utf8,
+    "end_date": pl.Utf8,
+    "category": pl.Utf8,
+    "tags": pl.List(pl.Utf8),
+    "event_ids": pl.List(pl.Utf8),
+    "neg_risk": pl.Boolean,
+    "is_politics": pl.Boolean,
+    "clob_token_ids": pl.List(pl.Utf8),
+    "outcomes": pl.List(pl.Utf8),
+}
+
 
 def load_markets(data_root: Path) -> pl.DataFrame:
     """Union of the open + closed market cohorts (both required: the keyset
@@ -189,12 +209,18 @@ def load_markets(data_root: Path) -> pl.DataFrame:
             "WARNING: no events snapshot found — tag enrichment reduced to the "
             "markets' own embedded tags. Run scripts/backfill_gamma.py --endpoint events"
         )
-    rows = []
+    # Page-at-a-time into compact columnar frames: 1.7M+ markets as Python dicts
+    # would eat several GB; explicit schema keeps empty-list columns consistent.
+    frames = []
     for snap in snaps.values():
         for page in sorted(snap.glob("page-*.parquet")):
-            for r in pl.read_parquet(page, columns=["raw_json"])["raw_json"].to_list():
-                rows.append(extract_market_row(json.loads(r), event_tags))
-    df = pl.DataFrame(rows).unique(subset=["market_id"], keep="last")
+            rows = [
+                extract_market_row(json.loads(r), event_tags)
+                for r in pl.read_parquet(page, columns=["raw_json"])["raw_json"].to_list()
+            ]
+            if rows:
+                frames.append(pl.DataFrame(rows, schema=MARKET_SCHEMA))
+    df = pl.concat(frames, how="vertical").unique(subset=["market_id"], keep="last")
     return df
 
 
@@ -227,13 +253,18 @@ def token_map(markets: pl.DataFrame) -> pl.DataFrame:
             return_dtype=pl.Utf8,
         ),
     )
-    # A token id must map to exactly one market; duplicates would corrupt the join.
-    dups = exploded.filter(pl.col("token_id_hex").is_duplicated())
-    if not dups.is_empty():
-        raise ValueError(
-            f"{dups.height} duplicate token_id_hex rows in Gamma metadata; "
-            f"sample: {dups.head(5).to_dicts()}"
+    # A token id must map to exactly one market; ambiguous mappings are
+    # quarantined (dropped from the join -> those trades become chain_only)
+    # and reported loudly rather than crashing a multi-hour build.
+    dup_mask = exploded["token_id_hex"].is_duplicated()
+    n_dup = int(dup_mask.sum())
+    if n_dup:
+        sample = exploded.filter(dup_mask).head(4).select("token_id_hex", "market_id").to_dicts()
+        print(
+            f"WARNING: {n_dup} token rows with ambiguous token->market mapping "
+            f"quarantined out of {exploded.height}; sample: {sample}"
         )
+        exploded = exploded.filter(~dup_mask)
     return exploded.drop("outcomes")
 
 

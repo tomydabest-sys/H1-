@@ -168,22 +168,32 @@ def load_event_tags(data_root: Path) -> dict[str, tuple[str | None, list[str]]]:
     return out
 
 
+MARKET_COHORT_ENDPOINTS = ("markets_open", "markets_closed")
+
+
 def load_markets(data_root: Path) -> pl.DataFrame:
-    snap = latest_complete_snapshot(data_root)
-    if snap is None:
+    """Union of the open + closed market cohorts (both required: the keyset
+    endpoint silently hides closed markets unless closed=true is passed)."""
+    snaps = {}
+    for ep in MARKET_COHORT_ENDPOINTS:
+        snaps[ep] = latest_complete_snapshot(data_root, endpoint=ep)
+    missing = [ep for ep, s in snaps.items() if s is None]
+    if missing:
         raise FileNotFoundError(
-            "no complete Gamma snapshot under data/raw/gamma/markets/ — run scripts/backfill_gamma.py first"
+            f"missing complete Gamma snapshot(s) {missing} — run "
+            "scripts/backfill_gamma.py --endpoint <name> for each"
         )
     event_tags = load_event_tags(data_root)
     if not event_tags:
         print(
-            "WARNING: no events snapshot found — tags/categories unavailable, "
-            "is_politics will be false everywhere. Run scripts/backfill_gamma.py --endpoint events"
+            "WARNING: no events snapshot found — tag enrichment reduced to the "
+            "markets' own embedded tags. Run scripts/backfill_gamma.py --endpoint events"
         )
     rows = []
-    for page in sorted(snap.glob("page-*.parquet")):
-        for r in pl.read_parquet(page, columns=["raw_json"])["raw_json"].to_list():
-            rows.append(extract_market_row(json.loads(r), event_tags))
+    for snap in snaps.values():
+        for page in sorted(snap.glob("page-*.parquet")):
+            for r in pl.read_parquet(page, columns=["raw_json"])["raw_json"].to_list():
+                rows.append(extract_market_row(json.loads(r), event_tags))
     df = pl.DataFrame(rows).unique(subset=["market_id"], keep="last")
     return df
 

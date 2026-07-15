@@ -37,13 +37,21 @@ from tenacity import (
 )
 
 GAMMA_BASE = "https://gamma-api.polymarket.com"
-# Both list endpoints paginate the same way. Note (live-verified 2026-07-15):
-# the keyset /markets payload does NOT embed tags/categories — those live on
-# /events/keyset (events carry `tags` + `category`; markets embed event ids) —
-# so politics classification requires BOTH snapshots.
-ENDPOINTS = {
-    "markets": f"{GAMMA_BASE}/markets/keyset",
-    "events": f"{GAMMA_BASE}/events/keyset",
+# Live-verified 2026-07-15 (empirically — the OpenAPI spec claims no default
+# filter, but reality disagrees):
+#   * /markets/keyset silently excludes closed markets unless closed=true is
+#     passed (default listing starts at id 540817; closed=true starts at id 12).
+#     A resolution study needs the closed cohort above all, so markets are
+#     pulled as two EXPLICIT cohorts, never via the implicit default.
+#   * include_tag=true embeds top-level tags on each market; without it the
+#     payload carries none. Kept on as belt-and-suspenders alongside the
+#     events-snapshot tag join.
+#   * /events/keyset appears unfiltered by default (closed 2021 events on
+#     page 1) and events carry tags + category.
+ENDPOINTS: dict[str, tuple[str, dict[str, str]]] = {
+    "markets_open": (f"{GAMMA_BASE}/markets/keyset", {"closed": "false", "include_tag": "true"}),
+    "markets_closed": (f"{GAMMA_BASE}/markets/keyset", {"closed": "true", "include_tag": "true"}),
+    "events": (f"{GAMMA_BASE}/events/keyset", {}),
 }
 PAGE_LIMIT = 100
 
@@ -71,7 +79,7 @@ def _utcnow() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def snapshot_dir(data_root: Path, snapshot: str | None = None, endpoint: str = "markets") -> Path:
+def snapshot_dir(data_root: Path, snapshot: str | None = None, endpoint: str = "markets_open") -> Path:
     snap = snapshot or datetime.now(timezone.utc).strftime("%Y-%m-%d")
     return data_root / "raw" / "gamma" / endpoint / f"snapshot={snap}"
 
@@ -105,8 +113,10 @@ def _respect_retry_after(exc: BaseException) -> None:
     else None,
     reraise=True,
 )
-def _fetch_page(client: httpx.Client, url: str, after_cursor: str | None) -> dict:
-    params: dict[str, Any] = {"limit": PAGE_LIMIT}
+def _fetch_page(
+    client: httpx.Client, url: str, after_cursor: str | None, extra_params: dict[str, str] | None = None
+) -> dict:
+    params: dict[str, Any] = {**(extra_params or {}), "limit": PAGE_LIMIT}
     if after_cursor:
         params["after_cursor"] = after_cursor
     resp = client.get(url, params=params, timeout=30.0)
@@ -175,12 +185,12 @@ def run_snapshot(
     snapshot: str | None = None,
     client: httpx.Client | None = None,
     max_pages: int | None = None,
-    endpoint: str = "markets",
+    endpoint: str = "markets_open",
 ) -> dict:
-    """Pull (or resume) one full metadata snapshot (markets or events). Returns summary stats."""
+    """Pull (or resume) one full metadata snapshot. Returns summary stats."""
     if endpoint not in ENDPOINTS:
         raise ValueError(f"endpoint must be one of {sorted(ENDPOINTS)}")
-    url = ENDPOINTS[endpoint]
+    url, extra_params = ENDPOINTS[endpoint]
     own_client = client is None
     client = client or httpx.Client(headers={"User-Agent": "h1-polymarket-research/0.1"})
     sdir = snapshot_dir(data_root, snapshot, endpoint=endpoint)
@@ -199,7 +209,7 @@ def run_snapshot(
     markets_written = 0
     try:
         while True:
-            js = _fetch_page(client, url, after_cursor)["json"]
+            js = _fetch_page(client, url, after_cursor, extra_params)["json"]
             items, next_cursor = parse_page(js)
             if not items:
                 break
@@ -237,7 +247,7 @@ def run_snapshot(
             client.close()
 
 
-def latest_complete_snapshot(data_root: Path, endpoint: str = "markets") -> Path | None:
+def latest_complete_snapshot(data_root: Path, endpoint: str = "markets_open") -> Path | None:
     root = data_root / "raw" / "gamma" / endpoint
     if not root.exists():
         return None

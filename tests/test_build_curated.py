@@ -54,7 +54,9 @@ def _write_snapshot(data_root, endpoint: str, items: list[dict]) -> None:
 
 
 def write_gamma_snapshot(data_root, markets: list[dict], events: list[dict]) -> None:
-    _write_snapshot(data_root, "markets", markets)
+    # both cohorts are mandatory; split fixture markets by their closed flag
+    _write_snapshot(data_root, "markets_open", [m for m in markets if not m["closed"]])
+    _write_snapshot(data_root, "markets_closed", [m for m in markets if m["closed"]])
     _write_snapshot(data_root, "events", events)
 
 

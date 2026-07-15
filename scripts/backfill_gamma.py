@@ -17,7 +17,7 @@ from ingest.gamma_markets import ENDPOINTS, run_snapshot
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--endpoint", default="markets", choices=sorted(ENDPOINTS))
+    ap.add_argument("--endpoint", default="markets_open", choices=sorted(ENDPOINTS))
     ap.add_argument("--snapshot", default=None, help="snapshot label (default: today UTC)")
     ap.add_argument("--max-pages", type=int, default=None, help="stop after N pages (resumable)")
     args = ap.parse_args()

@@ -93,7 +93,7 @@ def norm_token_id_hex(decimal_str: str) -> str:
     return hex(int(decimal_str))
 
 
-def _finish_trades(df: pl.DataFrame, exchange: str, generation: int, exchange_address: str) -> pl.DataFrame:
+def _finish_trades(df: "pl.DataFrame | pl.LazyFrame", exchange: str, generation: int, exchange_address: str):
     return df.with_columns(
         exchange=pl.lit(exchange),
         generation=pl.lit(generation, dtype=pl.Int8),
@@ -103,7 +103,8 @@ def _finish_trades(df: pl.DataFrame, exchange: str, generation: int, exchange_ad
     ).select(TRADE_COLUMNS)
 
 
-def decode_order_filled_v1(raw: pl.DataFrame, exchange: str, exchange_address: str) -> pl.DataFrame:
+def decode_order_filled_v1(raw: "pl.DataFrame | pl.LazyFrame", exchange: str, exchange_address: str):
+    """Works on eager or lazy frames; pass a scan for memory-safe streaming."""
     maker_is_buy = _word_is_zero(0)
     df = raw.select(
         pl.col("block_number"),
@@ -122,7 +123,8 @@ def decode_order_filled_v1(raw: pl.DataFrame, exchange: str, exchange_address: s
     return _finish_trades(df, exchange, 1, exchange_address)
 
 
-def decode_order_filled_v2(raw: pl.DataFrame, exchange: str, exchange_address: str) -> pl.DataFrame:
+def decode_order_filled_v2(raw: "pl.DataFrame | pl.LazyFrame", exchange: str, exchange_address: str):
+    """Works on eager or lazy frames; pass a scan for memory-safe streaming."""
     maker_is_buy = _word_int(0) == 0
     df = raw.select(
         pl.col("block_number"),

@@ -47,18 +47,28 @@ def _read_stream_raw(data_root: Path, stream: str) -> pl.DataFrame | None:
     return pl.read_parquet(parts)
 
 
-def decode_all_trades(data_root: Path) -> pl.DataFrame:
+def _scan_stream_raw(data_root: Path, stream: str) -> pl.LazyFrame | None:
+    d = data_root / "raw" / "hypersync" / stream
+    parts = sorted(d.glob("part-*.parquet"))
+    if not parts:
+        return None
+    return pl.scan_parquet(parts)
+
+
+def scan_all_trades(data_root: Path) -> pl.LazyFrame | None:
+    """Lazy decode of all OrderFilled streams (memory-safe: streams, never
+    materializes the full event set)."""
     frames = []
     for name, spec in STREAMS.items():
         if spec.generation is None:
             continue
-        raw = _read_stream_raw(data_root, name)
-        if raw is None or raw.is_empty():
+        raw = _scan_stream_raw(data_root, name)
+        if raw is None:
             continue
         fn = decode.decode_order_filled_v1 if spec.generation == 1 else decode.decode_order_filled_v2
         frames.append(fn(raw, exchange=name, exchange_address=STREAM_EXCHANGE_ADDRESS[name]))
     if not frames:
-        return pl.DataFrame(schema={c: pl.Utf8 for c in decode.TRADE_COLUMNS})
+        return None
     trades = pl.concat(frames, how="vertical")
     # (tx_hash, log_index) is globally unique on-chain; duplicates can only come
     # from overlapping re-scans and are safe to collapse.
@@ -141,16 +151,20 @@ def extract_market_row(raw: dict, event_tags: dict[str, tuple[str | None, list[s
 
 
 def load_event_tags(data_root: Path) -> dict[str, tuple[str | None, list[str]]]:
-    """event id -> (category, [tag slugs/labels]) from the latest events snapshot."""
+    """event id -> (category, [tag slugs/labels]) from the latest events snapshot.
+
+    Streams page-by-page: the events snapshot is multi-GB (each event embeds its
+    markets), so materializing all pages at once OOMs a 16GB container.
+    """
     snap = latest_complete_snapshot(data_root, endpoint="events")
     if snap is None:
         return {}
-    pages = pl.read_parquet(sorted(snap.glob("page-*.parquet")))
     out: dict[str, tuple[str | None, list[str]]] = {}
-    for raw_str in pages["raw_json"].to_list():
-        raw = json.loads(raw_str)
-        tags = sorted(_collect_tags({"tags": raw.get("tags")}))
-        out[str(raw.get("id", ""))] = (raw.get("category") or None, tags)
+    for page in sorted(snap.glob("page-*.parquet")):
+        for raw_str in pl.read_parquet(page, columns=["raw_json"])["raw_json"].to_list():
+            raw = json.loads(raw_str)
+            tags = sorted(_collect_tags({"tags": raw.get("tags")}))
+            out[str(raw.get("id", ""))] = (raw.get("category") or None, tags)
     return out
 
 
@@ -166,10 +180,10 @@ def load_markets(data_root: Path) -> pl.DataFrame:
             "WARNING: no events snapshot found — tags/categories unavailable, "
             "is_politics will be false everywhere. Run scripts/backfill_gamma.py --endpoint events"
         )
-    pages = pl.read_parquet(sorted(snap.glob("page-*.parquet")))
-    rows = [
-        extract_market_row(json.loads(r), event_tags) for r in pages["raw_json"].to_list()
-    ]
+    rows = []
+    for page in sorted(snap.glob("page-*.parquet")):
+        for r in pl.read_parquet(page, columns=["raw_json"])["raw_json"].to_list():
+            rows.append(extract_market_row(json.loads(r), event_tags))
     df = pl.DataFrame(rows).unique(subset=["market_id"], keep="last")
     return df
 
@@ -217,7 +231,6 @@ def build(data_root: Path) -> dict:
     curated = data_root / "curated"
     curated.mkdir(parents=True, exist_ok=True)
 
-    trades = decode_all_trades(data_root)
     markets = load_markets(data_root)
     tokens = token_map(markets)
 
@@ -240,18 +253,39 @@ def build(data_root: Path) -> dict:
         .otherwise(pl.lit("open"))
     )
 
-    trades = trades.join(
-        tokens.select("token_id_hex", "market_id", "condition_id", "is_politics", "neg_risk", "outcome_index", "outcome_label"),
-        on="token_id_hex",
-        how="left",
-    ).with_columns(
-        cohort=pl.when(pl.col("market_id").is_null())
-        .then(pl.lit("chain_only"))
-        .otherwise(pl.lit("matched")),
-        is_politics=pl.col("is_politics").fill_null(False),
-    )
+    trades_path = curated / "trades.parquet"
+    trades_lf = scan_all_trades(data_root)
+    if trades_lf is None:
+        pl.DataFrame(schema={c: pl.Utf8 for c in decode.TRADE_COLUMNS}).write_parquet(trades_path)
+        n_trades = 0
+        n_chain_only = 0
+    else:
+        joined = trades_lf.join(
+            tokens.select(
+                "token_id_hex", "market_id", "condition_id", "is_politics",
+                "neg_risk", "outcome_index", "outcome_label",
+            ).lazy(),
+            on="token_id_hex",
+            how="left",
+        ).with_columns(
+            cohort=pl.when(pl.col("market_id").is_null())
+            .then(pl.lit("chain_only"))
+            .otherwise(pl.lit("matched")),
+            is_politics=pl.col("is_politics").fill_null(False),
+        )
+        # sink_parquet executes the whole decode+dedup+join as a streaming query
+        joined.sink_parquet(trades_path)
+        counts = (
+            pl.scan_parquet(trades_path)
+            .select(
+                pl.len().alias("n"),
+                (pl.col("cohort") == "chain_only").sum().alias("chain_only"),
+            )
+            .collect()
+        )
+        n_trades = int(counts["n"][0])
+        n_chain_only = int(counts["chain_only"][0])
 
-    trades.write_parquet(curated / "trades.parquet")
     markets.write_parquet(curated / "markets.parquet")
     if not resolutions.is_empty():
         resolutions.write_parquet(curated / "resolutions.parquet")
@@ -259,10 +293,10 @@ def build(data_root: Path) -> dict:
         conditions.write_parquet(curated / "conditions.parquet")
 
     return {
-        "trades": trades.height,
+        "trades": n_trades,
         "markets": markets.height,
         "resolutions": resolutions.height if not resolutions.is_empty() else 0,
         "conditions": conditions.height if not conditions.is_empty() else 0,
         "politics_markets": int(markets["is_politics"].sum()),
-        "chain_only_trades": int((trades["cohort"] == "chain_only").sum()),
+        "chain_only_trades": n_chain_only,
     }

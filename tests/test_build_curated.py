@@ -38,6 +38,8 @@ def gamma_event(eid: int, tags: list[str]) -> dict:
 
 
 def _write_snapshot(data_root, endpoint: str, items: list[dict]) -> None:
+    from ingest.gamma_markets import PAGE_SCHEMA
+
     sdir = data_root / "raw" / "gamma" / endpoint / "snapshot=2026-07-01"
     sdir.mkdir(parents=True)
     rows = [
@@ -49,7 +51,7 @@ def _write_snapshot(data_root, endpoint: str, items: list[dict]) -> None:
         }
         for m in items
     ]
-    pq.write_table(pa.Table.from_pylist(rows), sdir / "page-00000.parquet")
+    pq.write_table(pa.Table.from_pylist(rows, schema=PAGE_SCHEMA), sdir / "page-00000.parquet")
     (sdir / "_COMPLETE").write_text("{}")
 
 
@@ -133,6 +135,39 @@ def test_build_dedup_join_cohorts(data_root):
 
     res = pl.read_parquet(data_root / "curated" / "resolutions.parquet")
     assert res.to_dicts()[0]["payout_numerators"] == [1, 0]
+
+    bars = pl.read_parquet(data_root / "curated" / "daily_bars.parquet")
+    b = bars.filter(pl.col("market_id") == "1").to_dicts()[0]
+    assert b["n_fills"] == 1
+    assert abs(b["usd_volume"] - 0.6) < 1e-9
+    assert abs(b["vwap"] - 0.6) < 1e-9
+    assert abs(b["last_price"] - 0.6) < 1e-9
+    assert b["is_politics"] is True
+    assert b["taker_buy_usd"] == 0.0  # no taker-aggregate rows in fixture
+
+
+def test_build_without_trades_sink(data_root):
+    write_raw_part(
+        data_root,
+        "orderfilled_ctf_v1",
+        [
+            v1_order_filled_row(
+                maker=MAKER, taker=TAKER, maker_asset_id=0,
+                taker_asset_id=TOKEN_POLITICS_YES, maker_amount=500_000,
+                taker_amount=1_000_000, log_index=1,
+            )
+        ],
+    )
+    write_gamma_snapshot(
+        data_root,
+        markets=[gamma_market(1, COND_POLITICS, [TOKEN_POLITICS_YES], event_id=11, closed=True)],
+        events=[gamma_event(11, ["us-politics"])],
+    )
+    stats = build(data_root, write_trades=False)
+    assert stats["trades"] == 0
+    assert stats["daily_bars"] == 1
+    assert not (data_root / "curated" / "trades.parquet").exists()
+    assert (data_root / "curated" / "daily_bars.parquet").exists()
 
 
 def test_politics_classification_rule():

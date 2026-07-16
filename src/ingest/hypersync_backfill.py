@@ -30,8 +30,9 @@ import pyarrow.parquet as pq
 from ingest.contracts import CONFIRMATIONS, POLYGON_HYPERSYNC_URL, STREAMS, StreamSpec
 
 # Abort cleanly (checkpoint already saved) rather than fill the disk: a killed
-# run resumes, a full disk corrupts everything around it.
-MIN_FREE_BYTES = 5 * 1024**3
+# run resumes, a full disk corrupts everything around it. 3GB is still ~two
+# orders of magnitude above a single batch write.
+MIN_FREE_BYTES = 3 * 1024**3
 
 RAW_SCHEMA = pa.schema(
     [

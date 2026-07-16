@@ -220,6 +220,8 @@ def load_markets(data_root: Path) -> pl.DataFrame:
             ]
             if rows:
                 frames.append(pl.DataFrame(rows, schema=MARKET_SCHEMA))
+    if not frames:
+        return pl.DataFrame(schema=MARKET_SCHEMA)
     df = pl.concat(frames, how="vertical").unique(subset=["market_id"], keep="last")
     return df
 
@@ -268,7 +270,49 @@ def token_map(markets: pl.DataFrame) -> pl.DataFrame:
     return exploded.drop("outcomes")
 
 
-def build(data_root: Path) -> dict:
+def build_daily_bars(trades_lf: pl.LazyFrame, out_path: Path) -> None:
+    """Per-token daily bars with maker/taker side splits — the compact
+    analysis-ready form when the fill-level table exceeds local disk.
+
+    Volume/notional aggregates use only maker rows (taker_is_exchange=False)
+    to avoid double counting; the taker_* columns aggregate the per-taker-order
+    rows (taker_is_exchange=True) that Polymarket's public feed calls "trades",
+    keyed by the taker order's side — inputs for the maker/taker asymmetry.
+    All values derive strictly from fills within the bar's UTC date.
+    """
+    maker = ~pl.col("taker_is_exchange")
+    taker = pl.col("taker_is_exchange")
+    buy = pl.col("side") == "BUY"
+    bars = (
+        trades_lf.with_columns(
+            date=pl.from_epoch(pl.col("block_timestamp")).dt.date()
+        )
+        .group_by("token_id_hex", "date")
+        .agg(
+            market_id=pl.col("market_id").drop_nulls().first(),
+            condition_id=pl.col("condition_id").drop_nulls().first(),
+            is_politics=pl.col("is_politics").any(),
+            n_fills=maker.sum(),
+            usd_volume=pl.col("usd_notional").filter(maker).sum(),
+            token_volume=pl.col("token_amount").filter(maker).sum(),
+            collateral_volume=pl.col("collateral_amount").filter(maker).sum(),
+            last_price=pl.col("price").sort_by("block_number", "log_index").last(),
+            fees=pl.col("fee").filter(maker).sum(),
+            taker_buy_usd=pl.col("usd_notional").filter(taker & buy).sum(),
+            taker_buy_tokens=pl.col("token_amount").filter(taker & buy).sum(),
+            taker_sell_usd=pl.col("usd_notional").filter(taker & ~buy).sum(),
+            taker_sell_tokens=pl.col("token_amount").filter(taker & ~buy).sum(),
+        )
+        .with_columns(
+            vwap=pl.col("collateral_volume") / pl.col("token_volume"),
+        )
+    )
+    bars.sink_parquet(out_path)
+
+
+def build(data_root: Path, write_trades: bool = True, write_daily_bars: bool = True) -> dict:
+    """Build curated tables. `write_trades=False` skips the fill-level sink when
+    it would not fit on disk (it stays rebuildable from raw at any time)."""
     curated = data_root / "curated"
     curated.mkdir(parents=True, exist_ok=True)
 
@@ -298,11 +342,14 @@ def build(data_root: Path) -> dict:
     )
 
     trades_path = curated / "trades.parquet"
+    bars_path = curated / "daily_bars.parquet"
     trades_lf = scan_all_trades(data_root)
+    n_trades = 0
+    n_chain_only = 0
+    n_bars = 0
     if trades_lf is None:
-        pl.DataFrame(schema={c: pl.Utf8 for c in decode.TRADE_COLUMNS}).write_parquet(trades_path)
-        n_trades = 0
-        n_chain_only = 0
+        if write_trades:
+            pl.DataFrame(schema={c: pl.Utf8 for c in decode.TRADE_COLUMNS}).write_parquet(trades_path)
     else:
         joined = trades_lf.join(
             tokens.select(
@@ -317,18 +364,22 @@ def build(data_root: Path) -> dict:
             .otherwise(pl.lit("matched")),
             is_politics=pl.col("is_politics").fill_null(False),
         )
-        # sink_parquet executes the whole decode+dedup+join as a streaming query
-        joined.sink_parquet(trades_path)
-        counts = (
-            pl.scan_parquet(trades_path)
-            .select(
-                pl.len().alias("n"),
-                (pl.col("cohort") == "chain_only").sum().alias("chain_only"),
+        if write_trades:
+            # sink_parquet executes the whole decode+dedup+join as a streaming query
+            joined.sink_parquet(trades_path)
+            counts = (
+                pl.scan_parquet(trades_path)
+                .select(
+                    pl.len().alias("n"),
+                    (pl.col("cohort") == "chain_only").sum().alias("chain_only"),
+                )
+                .collect()
             )
-            .collect()
-        )
-        n_trades = int(counts["n"][0])
-        n_chain_only = int(counts["chain_only"][0])
+            n_trades = int(counts["n"][0])
+            n_chain_only = int(counts["chain_only"][0])
+        if write_daily_bars:
+            build_daily_bars(joined, bars_path)
+            n_bars = int(pl.scan_parquet(bars_path).select(pl.len()).collect().item())
 
     markets.write_parquet(curated / "markets.parquet")
     if not resolutions.is_empty():
@@ -338,6 +389,7 @@ def build(data_root: Path) -> dict:
 
     return {
         "trades": n_trades,
+        "daily_bars": n_bars,
         "markets": markets.height,
         "resolutions": resolutions.height if not resolutions.is_empty() else 0,
         "conditions": conditions.height if not conditions.is_empty() else 0,

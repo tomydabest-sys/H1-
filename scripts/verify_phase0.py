@@ -67,11 +67,72 @@ def report_streams() -> None:
             fail(f"{name}: {zero_ts} rows with missing block timestamps")
 
 
+def report_bars() -> None:
+    """Bar-level checks used when the fill-level table is skipped for disk."""
+    bpath = DATA / "curated" / "daily_bars.parquet"
+    bars = pl.read_parquet(bpath)
+    print(f"daily bars: {bars.height} (token-days)")
+
+    dups = bars.height - bars.unique(subset=["token_id_hex", "date"]).height
+    (ok if dups == 0 else fail)(f"duplicate (token, date) bars: {dups}")
+
+    neg = bars.filter(
+        (pl.col("n_fills") < 0) | (pl.col("usd_volume") < 0) | (pl.col("token_volume") < 0)
+    ).height
+    (ok if neg == 0 else fail)(f"bars with negative volumes: {neg}")
+
+    with_fills = bars.filter(pl.col("n_fills") > 0)
+    bad_price = with_fills.filter(
+        (pl.col("vwap") <= 0) | (pl.col("vwap") >= 1)
+        | (pl.col("last_price") <= 0) | (pl.col("last_price") >= 1)
+    ).height
+    frac = bad_price / max(with_fills.height, 1)
+    (ok if frac < 0.01 else fail)(
+        f"bars with vwap/last_price outside (0,1): {bad_price} ({frac:.3%})"
+    )
+
+    pol = bars.filter(pl.col("is_politics"))
+    print(f"politics token-days: {pol.height}; politics conditions with bars: {pol['condition_id'].n_unique()}")
+    print(f"date range: {bars['date'].min()} .. {bars['date'].max()}")
+    print(f"total maker-side usd volume: ${bars['usd_volume'].sum():,.0f}")
+
+    mpath = DATA / "curated" / "markets.parquet"
+    if mpath.exists():
+        markets = pl.read_parquet(mpath)
+        print(f"\nmarkets: {markets.height}  politics: {int(markets['is_politics'].sum())}")
+        print("market cohorts:")
+        print(markets.group_by("cohort", "is_politics").len().sort("cohort"))
+
+    rpath = DATA / "curated" / "resolutions.parquet"
+    if rpath.exists():
+        res = pl.read_parquet(rpath)
+        print(f"on-chain resolutions: {res.height}")
+        zero_denorm = res.filter(pl.col("payout_numerators").list.sum() <= 0).height
+        (ok if zero_denorm == 0 else fail)(f"resolutions with non-positive payout sum: {zero_denorm}")
+
+
+def report_retention() -> None:
+    print("\n== raw retention coverage ==")
+    for name in STREAMS:
+        f = DATA / "raw" / "hypersync" / name / "_retention.json"
+        if not f.exists():
+            print(f"[{name}] no retention manifest")
+            continue
+        import json as _json
+
+        segs = _json.loads(f.read_text())["segments"]
+        desc = "; ".join(f"{s['mode']} {s['from_block']}..{s['to_block']}" for s in segs)
+        print(f"[{name}] {desc}")
+
+
 def report_curated() -> None:
     print("\n== curated ==")
     tpath = DATA / "curated" / "trades.parquet"
     if not tpath.exists():
-        print("no curated trades yet (run scripts/build_curated.py)")
+        if (DATA / "curated" / "daily_bars.parquet").exists():
+            report_bars()
+        else:
+            print("no curated tables yet (run scripts/build_curated.py)")
         return
 
     trades = pl.read_parquet(tpath)
@@ -123,15 +184,23 @@ def report_curated() -> None:
 def check_idempotency() -> None:
     print("\n== idempotency (per-token trade counts non-decreasing across runs) ==")
     tpath = DATA / "curated" / "trades.parquet"
-    if not tpath.exists():
-        print("skipped (no curated trades)")
+    bpath = DATA / "curated" / "daily_bars.parquet"
+    if tpath.exists():
+        counts = (
+            pl.read_parquet(tpath, columns=["token_id_hex"])
+            .group_by("token_id_hex")
+            .len()
+            .rename({"len": "n"})
+        )
+    elif bpath.exists():
+        counts = (
+            pl.read_parquet(bpath, columns=["token_id_hex", "n_fills"])
+            .group_by("token_id_hex")
+            .agg(n=pl.col("n_fills").sum())
+        )
+    else:
+        print("skipped (no curated tables)")
         return
-    counts = (
-        pl.read_parquet(tpath, columns=["token_id_hex"])
-        .group_by("token_id_hex")
-        .len()
-        .rename({"len": "n"})
-    )
     SNAP_DIR.mkdir(parents=True, exist_ok=True)
     prev_path = SNAP_DIR / "token_counts_prev.parquet"
     if prev_path.exists():
@@ -151,6 +220,7 @@ def check_idempotency() -> None:
 def main() -> int:
     print(f"data root: {DATA}")
     report_streams()
+    report_retention()
     report_curated()
     check_idempotency()
     print("\n== verdict ==")

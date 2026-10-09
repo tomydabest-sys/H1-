@@ -129,3 +129,32 @@ def test_respects_confirmation_headroom(data_root):
         run_stream(SPEC, data_root=data_root, client=client, to_block=10_000, log_every=0)
     )
     assert result.last_committed_block == 200
+
+
+def test_crash_still_records_retention_segment(data_root):
+    # A run that dies mid-way has advanced its checkpoint; the covered range and
+    # its retention mode must be recorded, or coverage checks see a false gap.
+    import json
+
+    crashing = FakeClient(RESPONSES, height=10_000, crash_at_call=2)
+    with pytest.raises(ConnectionError):
+        asyncio.run(
+            run_stream(
+                SPEC, data_root=data_root, client=crashing, to_block=300, log_every=0,
+                row_filter=lambda r: True,
+            )
+        )
+    sdir = stream_dir(data_root, SPEC.name)
+    segs = json.loads((sdir / "_retention.json").read_text())["segments"]
+    assert [(s["mode"], s["from_block"], s["to_block"]) for s in segs] == [
+        ("politics_only", 100, 149)
+    ]
+
+    asyncio.run(
+        run_stream(
+            SPEC, data_root=data_root, client=FakeClient(RESPONSES, height=10_000),
+            to_block=300, log_every=0, row_filter=lambda r: True,
+        )
+    )
+    segs = json.loads((sdir / "_retention.json").read_text())["segments"]
+    assert [(s["from_block"], s["to_block"]) for s in segs] == [(100, 149), (150, 300)]

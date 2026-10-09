@@ -56,6 +56,10 @@ V1_NEGRISK_FROM_BLOCK = 33_000_000  # deployed Nov 2023; shared floor for safety
 V2_FROM_BLOCK = 84_902_353  # V2 deployment (2026-04-28 migration)
 CTF_FROM_BLOCK = 4_000_000  # Conditional Tokens deployed Sep 2020
 
+# Phase 0 dataset end (inclusive), pinned 2026-10-09 = safe tip (height
+# 95,199,793 minus CONFIRMATIONS). Supersedes the July pin 90,271,602.
+PINNED_END_BLOCK = 95_199_593
+
 
 @dataclass(frozen=True)
 class StreamSpec:

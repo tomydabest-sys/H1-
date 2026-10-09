@@ -20,9 +20,10 @@
 
 - `uv run python scripts/backfill_gamma.py` — pull a Gamma market-metadata snapshot (keyset pagination; resumable; no auth).
 - `uv run python scripts/backfill_gamma.py --endpoint events` — pull the Gamma events snapshot; REQUIRED for tags/categories (the keyset markets payload does not embed tags — politics classification joins tags from events).
-- `uv run python scripts/backfill_chain.py --stream all [--to-block N]` — HyperSync backfill of the four OrderFilled streams + CTF events (resumable; requires `HYPERSYNC_BEARER_TOKEN` in `.env`, see `.env.example`).
+- `uv run python scripts/backfill_gamma.py --endpoint markets_closed` — closed markets (the default endpoint is `markets_open` only; build_curated needs both).
+- `uv run python scripts/backfill_chain.py --stream all --politics-filter --to-block 95199593` — HyperSync backfill of the four OrderFilled streams + CTF events (resumable; requires `HYPERSYNC_BEARER_TOKEN` in `.env`, see `.env.example`).
 - `uv run python scripts/build_curated.py` — decode raw events, dedup, join metadata → `data/curated/`.
-- `uv run python scripts/verify_phase0.py` — Phase 0 verification report (pass/fail exit code).
+- `uv run python scripts/verify_phase0.py` — Phase 0 verification report (pass/fail exit code; fails on missing streams/tables or coverage short of the pinned end block 95,199,593).
 
 ## Kill criteria
 

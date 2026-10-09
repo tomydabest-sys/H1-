@@ -249,43 +249,47 @@ async def run_stream(
 
     query = _build_query(spec, start_block, end_inclusive + 1)
     batch = 0
-    while True:
-        if shutil.disk_usage(sdir).free < MIN_FREE_BYTES:
-            raise DiskSpaceError(
-                f"[{spec.name}] free disk below {MIN_FREE_BYTES // 1024**3}GB at "
-                f"block {result.last_committed_block}; checkpoint saved — free space and re-run"
+    # Record coverage even when the run dies mid-way (disk guard, crash,
+    # restart): the checkpoint has already advanced past those blocks.
+    try:
+        while True:
+            if shutil.disk_usage(sdir).free < MIN_FREE_BYTES:
+                raise DiskSpaceError(
+                    f"[{spec.name}] free disk below {MIN_FREE_BYTES // 1024**3}GB at "
+                    f"block {result.last_committed_block}; checkpoint saved — free space and re-run"
+                )
+            res = await client.get(query)
+            next_block = res.next_block  # first block NOT covered by this response
+            covered_to = next_block - 1
+            rows = logs_to_rows(res.data.logs, block_ts_map(res.data.blocks))
+            if row_filter is not None:
+                rows = [r for r in rows if row_filter(r)]
+            if rows:
+                write_part(sdir, query.from_block, covered_to, rows)
+                result.parts_written += 1
+                result.events += len(rows)
+            save_checkpoint(sdir, covered_to)
+            result.last_committed_block = covered_to
+            batch += 1
+            if log_every and batch % log_every == 0:
+                print(
+                    f"[{spec.name}] blocks {query.from_block}..{covered_to} "
+                    f"(+{len(rows)} events, total {result.events})",
+                    flush=True,
+                )
+            if covered_to >= end_inclusive:
+                break
+            if max_batches is not None and batch >= max_batches:
+                break
+            query.from_block = next_block
+    finally:
+        if result.last_committed_block >= result.from_block:
+            append_retention_segment(
+                sdir,
+                mode="full" if row_filter is None else "politics_only",
+                from_block=result.from_block,
+                to_block=result.last_committed_block,
             )
-        res = await client.get(query)
-        next_block = res.next_block  # first block NOT covered by this response
-        covered_to = next_block - 1
-        rows = logs_to_rows(res.data.logs, block_ts_map(res.data.blocks))
-        if row_filter is not None:
-            rows = [r for r in rows if row_filter(r)]
-        if rows:
-            write_part(sdir, query.from_block, covered_to, rows)
-            result.parts_written += 1
-            result.events += len(rows)
-        save_checkpoint(sdir, covered_to)
-        result.last_committed_block = covered_to
-        batch += 1
-        if log_every and batch % log_every == 0:
-            print(
-                f"[{spec.name}] blocks {query.from_block}..{covered_to} "
-                f"(+{len(rows)} events, total {result.events})",
-                flush=True,
-            )
-        if covered_to >= end_inclusive:
-            break
-        if max_batches is not None and batch >= max_batches:
-            break
-        query.from_block = next_block
-    if result.last_committed_block >= result.from_block:
-        append_retention_segment(
-            sdir,
-            mode="full" if row_filter is None else "politics_only",
-            from_block=result.from_block,
-            to_block=result.last_committed_block,
-        )
     return result
 
 

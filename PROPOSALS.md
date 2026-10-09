@@ -39,8 +39,16 @@ if all-markets coverage is ever needed.
 above):** the 2026-07 Phase 0 data was lost when the idle cloud container was
 reclaimed, so Phase 0 is being re-run from scratch. Raw retention is now
 **politics-only for every stream and every block range** (from each stream's
-deployment block to the pinned end block 90,271,602), via `--politics-filter`.
-ConditionPreparation/ConditionResolution are still kept in full. Consequences
+deployment block to the end block), via `--politics-filter`.
+ConditionPreparation/ConditionResolution are still kept in full.
+**End block (user decision 2026-10-09): extended from 90,271,602 to the then-safe
+tip, pinned as `PINNED_END_BLOCK` = 95,199,593** (height 95,199,793 − 200
+confirmations). This adds more 2026-resolved markets to the out-of-sample cohort.
+It is fixed before `PREREGISTRATION.md` is written. `verify_phase0` fails unless
+every stream's checkpoint and gap-free retention coverage reach it.
+No GCS bucket is available, so persistence is: small curated tables committed to
+git, and raw politics parquet re-pullable from HyperSync (resumable).
+Consequences
 (flagged, not silently resolved):
 - Politics membership comes from the 2026-10-09 Gamma snapshots' tags. Using
   today's tags to choose which historical rows to keep is a selection on current

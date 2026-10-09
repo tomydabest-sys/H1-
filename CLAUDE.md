@@ -23,6 +23,7 @@
 - `uv run python scripts/backfill_gamma.py --endpoint markets_closed` — closed markets (the default endpoint is `markets_open` only; build_curated needs both).
 - `uv run python scripts/backfill_chain.py --stream all --politics-filter --to-block 95199593` — HyperSync backfill of the four OrderFilled streams + CTF events (resumable; requires `HYPERSYNC_BEARER_TOKEN` in `.env`, see `.env.example`).
 - `uv run python scripts/build_curated.py` — decode raw events, dedup, join metadata → `data/curated/`.
+- `scripts/persist_data.sh` — push new raw chain parts + curated tables to the orphan branch `phase0-data` (durable copy; restore: `git fetch origin phase0-data && git --work-tree=data checkout origin/phase0-data -- .`). Run at milestones.
 - `uv run python scripts/verify_phase0.py` — Phase 0 verification report (pass/fail exit code; fails on missing streams/tables or coverage short of the pinned end block 95,199,593).
 
 ## Kill criteria

@@ -12,7 +12,10 @@ The Becker archive lacked sufficient historical trade coverage for a proper Stag
 
 ## Phase 0 — Data backfill
 
-**Status: smoke run PASSED 2026-07-15 (verify_phase0 exit 0). Ingested: full Gamma
+**Status (2026-10-09): re-running from scratch — all 2026-07 data lost to an idle
+container reclaim; see the 2026-10-09 retention amendment below.**
+
+**Previous status: smoke run PASSED 2026-07-15 (verify_phase0 exit 0). Ingested: full Gamma
 metadata (1.71M closed + 60k open markets, 692k events) and the V2 exchanges from
 deployment through migration launch day (blocks 84,902,353–86,180,000: 6.69M fills,
 99.997% metadata-matched). Both decode assumptions verified — V2 side-mapping and
@@ -31,6 +34,27 @@ block 90,271,602.** ConditionPreparation/ConditionResolution are always kept in 
 Nothing is destroyed — non-politics ranges remain re-pullable from HyperSync; each
 stream's `_retention.json` records exact coverage. Revisit with a larger environment
 if all-markets coverage is ever needed.
+
+**Amendment (2026-10-09, user-approved; supersedes the 2026-07-15 retention split
+above):** the 2026-07 Phase 0 data was lost when the idle cloud container was
+reclaimed, so Phase 0 is being re-run from scratch. Raw retention is now
+**politics-only for every stream and every block range** (from each stream's
+deployment block to the pinned end block 90,271,602), via `--politics-filter`.
+ConditionPreparation/ConditionResolution are still kept in full. Consequences
+(flagged, not silently resolved):
+- Politics membership comes from the 2026-10-09 Gamma snapshots' tags. Using
+  today's tags to choose which historical rows to keep is a selection on current
+  metadata, not on prices or outcomes, so it is not label leakage. But tags
+  re-labelled after the fact, and markets delisted from Gamma, are invisible to
+  the filter.
+- Chain-only fills (no Gamma match) are no longer retained anywhere, so the
+  metadata-match rate stops measuring the join's coverage (it is ~100% by
+  construction) and the chain-only cohort cannot be sized.
+- The maker/taker aggregate-row cross-generation comparison and the V1-side
+  checks run on the politics subset only. They are not comparable to the
+  2026-07 all-markets smoke figures (6.69M V2 fills, 99.997% match).
+- Results must be persisted durably outside the container (see the persistence
+  plan) so a future idle reclaim cannot wipe them again.
 
 Amendments vs. the original spec, surfaced during exploration (not silently resolved):
 - **Four exchanges, not two:** added V1 NegRisk (`0xC5d5…f80a`) and V2 NegRisk

@@ -382,6 +382,9 @@ def build(data_root: Path, write_trades: bool = True, write_daily_bars: bool = T
             n_bars = int(pl.scan_parquet(bars_path).select(pl.len()).collect().item())
 
     markets.write_parquet(curated / "markets.parquet")
+    # Small, git-persistable record of the politics set the raw filter used
+    # (full markets.parquet can exceed GitHub's 100MB file limit).
+    markets.filter(pl.col("is_politics")).write_parquet(curated / "politics_markets.parquet")
     if not resolutions.is_empty():
         resolutions.write_parquet(curated / "resolutions.parquet")
     if not conditions.is_empty():

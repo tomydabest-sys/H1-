@@ -5,7 +5,7 @@
 # Append-only and disk-light: a throwaway git dir fetches only the branch tip's
 # commit + trees (no blobs), stages new/changed files straight from data/, and
 # commits + pushes in chunks under GitHub's 2GB-per-push limit. No second copy
-# of the data is kept. Files >= 95MB are refused (GitHub's limit is 100MB).
+# of the data is kept. Files >= 95MB are skipped with a warning (GitHub's limit is 100MB).
 #
 # Persisted: data/raw/hypersync/** (incl. checkpoints + _retention.json) and
 # data/curated/**. Gamma raw snapshots are NOT persisted (~4GB, re-pullable;
@@ -53,13 +53,17 @@ mapfile -t files < <(cd "$DATA" && g ls-files --others --modified --exclude-stan
 echo "${#files[@]} new/changed file(s)"
 [ ${#files[@]} -gt 0 ] || exit 0
 
+keep=()
 for f in "${files[@]}"; do
   sz=$(stat -c %s "$DATA/$f")
   if [ "$sz" -ge "$MAX_FILE" ]; then
-    echo "REFUSING: $f is $sz bytes (>= 95MB GitHub limit) — split it first" >&2
-    exit 1
+    echo "SKIPPING: $f is $sz bytes (>= 95MB GitHub limit) — not persisted" >&2
+  else
+    keep+=("$f")
   fi
 done
+files=("${keep[@]}")
+[ ${#files[@]} -gt 0 ] || exit 0
 
 push_chunk() {
   g commit -q -m "phase0 data snapshot $(date -u +%Y-%m-%dT%H:%MZ) ($1 files, $2 bytes)"

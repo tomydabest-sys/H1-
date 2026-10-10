@@ -256,3 +256,134 @@ def latest_complete_snapshot(data_root: Path, endpoint: str = "markets_open") ->
         key=lambda d: d.name,
     )
     return snaps[-1] if snaps else None
+
+
+# --- events by-id fallback -------------------------------------------------
+# Live finding 2026-10-10: /events/keyset returns a persistent 500 for the
+# cursor after event id 692222 (even at limit=1), so keyset paging cannot pass
+# it. The public /events endpoint accepts repeated `id=` params and returns the
+# same event payloads (tags/category identical; it omits only
+# `requiresTranslation`). The tail of the events snapshot is completed by
+# walking ascending id ranges. A batch that errors is bisected down to single
+# ids; ids that still fail are recorded, never silently dropped.
+EVENTS_BY_ID_URL = f"{GAMMA_BASE}/events"
+BYID_CHECKPOINT = "_byid_checkpoint.json"
+
+
+@retry(
+    retry=retry_if_exception(_retryable),
+    wait=wait_exponential_jitter(initial=1, max=30),
+    stop=stop_after_attempt(4),
+    after=lambda rs: _respect_retry_after(rs.outcome.exception())
+    if rs.outcome and rs.outcome.exception()
+    else None,
+    reraise=True,
+)
+def _fetch_events_by_id(client: httpx.Client, ids: list[int]) -> list[dict]:
+    params = [("id", str(i)) for i in ids] + [("limit", str(len(ids)))]
+    resp = client.get(EVENTS_BY_ID_URL, params=params, timeout=30.0)
+    resp.raise_for_status()
+    js = resp.json()
+    if not isinstance(js, list):
+        raise GammaShapeError(f"/events?id= returned {type(js).__name__}, expected list")
+    return js
+
+
+def _fetch_ids_bisecting(client: httpx.Client, ids: list[int], failed: list[int]) -> list[dict]:
+    try:
+        return _fetch_events_by_id(client, ids)
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code < 500:
+            raise
+        if len(ids) == 1:
+            failed.append(ids[0])
+            return []
+        mid = len(ids) // 2
+        return _fetch_ids_bisecting(client, ids[:mid], failed) + _fetch_ids_bisecting(client, ids[mid:], failed)
+
+
+def max_written_id(sdir: Path) -> int:
+    """Highest numeric id across a snapshot's pages (0 if none)."""
+    import polars as pl
+
+    pages = sorted(sdir.glob("page-*.parquet"))
+    if not pages:
+        return 0
+    ids = pl.read_parquet(pages[-50:], columns=["market_id"])["market_id"]
+    return int(ids.cast(pl.Int64, strict=False).max() or 0)
+
+
+def run_events_by_id(
+    data_root: Path,
+    snapshot: str,
+    client: httpx.Client | None = None,
+    batch: int = PAGE_LIMIT,
+    stop_after_empty_ids: int = 50_000,
+    max_batches: int | None = None,
+) -> dict:
+    """Finish an interrupted events snapshot by ascending id ranges (resumable).
+
+    Starts after the highest id already written (keyset pages are id-ordered);
+    ends after `stop_after_empty_ids` consecutive ids return nothing.
+    """
+    own_client = client is None
+    client = client or httpx.Client(headers={"User-Agent": "h1-polymarket-research/0.1"})
+    sdir = snapshot_dir(data_root, snapshot, endpoint="events")
+    if (sdir / "_COMPLETE").exists():
+        return {"snapshot_dir": str(sdir), "status": "already_complete", "events": 0}
+    ck_path = sdir / BYID_CHECKPOINT
+    if ck_path.exists():
+        ck = json.loads(ck_path.read_text())
+    else:
+        main = _load_checkpoint(sdir) or {}
+        start = max_written_id(sdir) + 1
+        ck = {
+            "start_id": start,
+            "next_id": start,
+            "next_page_index": int(main.get("next_page_index", 0)),
+            "last_found_id": start - 1,
+            "failed_ids": [],
+        }
+    written = 0
+    batches = 0
+    try:
+        while ck["next_id"] - ck["last_found_id"] <= stop_after_empty_ids:
+            ids = list(range(ck["next_id"], ck["next_id"] + batch))
+            failed: list[int] = []
+            events = _fetch_ids_bisecting(client, ids, failed)
+            events.sort(key=lambda e: int(e.get("id", 0)))
+            if events:
+                _write_page(sdir, ck["next_page_index"], events)
+                ck["next_page_index"] += 1
+                ck["last_found_id"] = max(ck["last_found_id"], int(events[-1]["id"]))
+                written += len(events)
+            ck["failed_ids"].extend(failed)
+            ck["next_id"] = ids[-1] + 1
+            ck["updated_at"] = _utcnow()
+            tmp = ck_path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(ck))
+            os.replace(tmp, ck_path)
+            batches += 1
+            if max_batches is not None and batches >= max_batches:
+                return {"snapshot_dir": str(sdir), "status": "paused_max_batches", "events": written}
+        (sdir / "_COMPLETE").write_text(
+            json.dumps(
+                {
+                    "finished_at": _utcnow(),
+                    "pages": ck["next_page_index"],
+                    "tail_source": "events?id= by-id fallback (keyset 500 after id "
+                    f"{ck['start_id'] - 1})",
+                    "byid_id_range": [ck["start_id"], ck["last_found_id"]],
+                    "failed_ids": ck["failed_ids"],
+                }
+            )
+        )
+        return {
+            "snapshot_dir": str(sdir),
+            "status": "complete",
+            "events": written,
+            "failed_ids": len(ck["failed_ids"]),
+        }
+    finally:
+        if own_client:
+            client.close()

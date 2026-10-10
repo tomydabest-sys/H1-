@@ -12,7 +12,7 @@ Usage:
 import argparse
 
 import _bootstrap
-from ingest.gamma_markets import ENDPOINTS, run_snapshot
+from ingest.gamma_markets import ENDPOINTS, run_events_by_id, run_snapshot
 
 
 def main() -> None:
@@ -20,8 +20,16 @@ def main() -> None:
     ap.add_argument("--endpoint", default="markets_open", choices=sorted(ENDPOINTS))
     ap.add_argument("--snapshot", default=None, help="snapshot label (default: today UTC)")
     ap.add_argument("--max-pages", type=int, default=None, help="stop after N pages (resumable)")
+    ap.add_argument("--by-id", action="store_true",
+                    help="events only: finish an interrupted snapshot via /events?id= ranges "
+                    "(workaround for the keyset 500 after event 692222); needs --snapshot")
     args = ap.parse_args()
 
+    if args.by_id:
+        if args.endpoint != "events" or not args.snapshot:
+            ap.error("--by-id requires --endpoint events and --snapshot")
+        print(run_events_by_id(_bootstrap.DATA_ROOT, snapshot=args.snapshot))
+        return
     stats = run_snapshot(
         _bootstrap.DATA_ROOT,
         snapshot=args.snapshot,

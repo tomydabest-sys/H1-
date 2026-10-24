@@ -40,7 +40,7 @@ while alive; do
 done
 
 for i in "${!pids[@]}"; do
-  wait "${pids[$i]}"; echo "$(ts) ${streams[$i]} exited with $?"
+  wait "${pids[$i]}"; rc=$?; echo "$(ts) ${streams[$i]} exited with $rc"
 done
 scripts/persist_data.sh || echo "$(ts) final persist failed"
 echo "$(ts) PIPELINE DONE"

@@ -178,3 +178,28 @@ def test_politics_classification_rule():
     assert extract_market_row(mk, {"11": ("US Elections", [])})["is_politics"] is True
     # no events snapshot at all -> not politics, never a crash
     assert extract_market_row(mk, None)["is_politics"] is False
+
+
+def test_load_markets_falls_back_to_frozen_curated_tables(data_root):
+    # Raw Gamma snapshots deleted (2026-10-25): reuse the frozen curated table,
+    # politics-only table second, and fail loudly only when neither exists.
+    import pytest
+
+    from normalize.build_curated import MARKET_SCHEMA, load_markets
+
+    curated = data_root / "curated"
+    curated.mkdir()
+    with pytest.raises(FileNotFoundError):
+        load_markets(data_root)
+
+    row = {c: None for c in MARKET_SCHEMA}
+    row.update(market_id="1", condition_id=COND_POLITICS, is_politics=True,
+               clob_token_ids=[str(TOKEN_POLITICS_YES)], tags=["politics"])
+    frozen = pl.DataFrame([row], schema=MARKET_SCHEMA).with_columns(cohort=pl.lit("open"))
+    frozen.write_parquet(curated / "politics_markets.parquet")
+    got = load_markets(data_root)
+    assert got.columns == list(MARKET_SCHEMA) and got.height == 1  # cohort dropped
+
+    pl.concat([frozen, frozen.with_columns(market_id=pl.lit("2"), is_politics=pl.lit(False))]
+              ).write_parquet(curated / "markets.parquet")
+    assert load_markets(data_root).height == 2  # full table preferred

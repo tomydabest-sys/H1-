@@ -199,9 +199,20 @@ def load_markets(data_root: Path) -> pl.DataFrame:
         snaps[ep] = latest_complete_snapshot(data_root, endpoint=ep)
     missing = [ep for ep, s in snaps.items() if s is None]
     if missing:
+        # 2026-10-25 (user-approved): raw Gamma snapshots were deleted for disk
+        # space; the 2026-10-09 metadata is frozen in the curated tables. Reuse
+        # them rather than re-pulling a newer snapshot (which would change the
+        # politics set mid-dataset). cohort is recomputed by build().
+        for name in ("markets.parquet", "politics_markets.parquet"):
+            frozen = data_root / "curated" / name
+            if frozen.exists():
+                print(f"NOTE: Gamma snapshot(s) {missing} absent — using frozen curated/{name}")
+                return pl.read_parquet(frozen).select(
+                    [pl.col(c).cast(t) for c, t in MARKET_SCHEMA.items()]
+                )
         raise FileNotFoundError(
-            f"missing complete Gamma snapshot(s) {missing} — run "
-            "scripts/backfill_gamma.py --endpoint <name> for each"
+            f"missing complete Gamma snapshot(s) {missing} and no frozen curated "
+            "markets table — run scripts/backfill_gamma.py --endpoint <name> for each"
         )
     event_tags = load_event_tags(data_root)
     if not event_tags:

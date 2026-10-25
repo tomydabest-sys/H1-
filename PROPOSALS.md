@@ -64,6 +64,17 @@ Consequences
 - Results must be persisted durably outside the container (see the persistence
   plan) so a future idle reclaim cannot wipe them again.
 
+**Amendment (2026-10-25, user-approved exception to CLAUDE.md rule 7):** the raw
+Gamma snapshots (`data/raw/gamma/`, 9.3GB, snapshot 2026-10-09) were deleted to
+free disk. The backfill had stopped at the 3GB free-disk guard with V1 CTF at
+block 84,427,927 and ctf_events at 84,974,262. The 2026-10-09 metadata stays
+frozen in `curated/markets.parquet` (4,179,932 markets; 65,085 politics) and
+`curated/politics_markets.parquet` (on `phase0-data`). `build_curated` now reuses
+those when the snapshots are absent, rather than re-pulling a newer snapshot that
+would change the politics set mid-dataset. Consequence: the market metadata can no
+longer be re-derived from raw. It can only be re-pulled as a new, slightly
+different snapshot.
+
 Amendments vs. the original spec, surfaced during exploration (not silently resolved):
 - **Four exchanges, not two:** added V1 NegRisk (`0xC5d5…f80a`) and V2 NegRisk
   (`0xe2222d…310F59`) — multi-outcome politics markets trade there.

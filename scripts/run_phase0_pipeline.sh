@@ -13,10 +13,14 @@ LOGDIR="${LOGDIR:-data/interim/logs}"
 mkdir -p "$LOGDIR"
 ts() { date -u +%FT%TZ; }
 
-for ep in markets_open markets_closed events; do
-  until ls data/raw/gamma/$ep/snapshot=*/_COMPLETE >/dev/null 2>&1; do sleep 60; done
-  echo "$(ts) gamma $ep complete"
-done
+# Gamma snapshots are only needed until curated/markets.parquet exists (raw
+# Gamma was deleted 2026-10-25 for disk; the frozen curated table replaces it).
+if [ ! -f data/curated/markets.parquet ]; then
+  for ep in markets_open markets_closed events; do
+    until ls data/raw/gamma/$ep/snapshot=*/_COMPLETE >/dev/null 2>&1; do sleep 60; done
+    echo "$(ts) gamma $ep complete"
+  done
+fi
 
 if [ ! -f data/curated/markets.parquet ]; then
   echo "$(ts) build_curated (metadata)"

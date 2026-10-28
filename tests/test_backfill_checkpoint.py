@@ -158,3 +158,25 @@ def test_crash_still_records_retention_segment(data_root):
     )
     segs = json.loads((sdir / "_retention.json").read_text())["segments"]
     assert [(s["from_block"], s["to_block"]) for s in segs] == [(100, 149), (150, 300)]
+
+
+def test_retention_recorded_before_any_exit(data_root):
+    # SIGKILL skips `finally`: the segment must already be on disk right after
+    # each checkpoint save, before the run ends in any way.
+    import json
+
+    sdir = stream_dir(data_root, SPEC.name)
+    seen = []
+
+    class Peeking(FakeClient):
+        async def get(self, query):
+            f = sdir / "_retention.json"
+            if f.exists():
+                seen.append([(s["from_block"], s["to_block"]) for s in json.loads(f.read_text())["segments"]])
+            return await super().get(query)
+
+    asyncio.run(run_stream(SPEC, data_root=data_root, client=Peeking(RESPONSES, height=10_000),
+                           to_block=300, log_every=0, row_filter=lambda r: True))
+    assert seen == [[(100, 149)], [(100, 199)]]  # one segment, extended per checkpoint
+    segs = json.loads((sdir / "_retention.json").read_text())["segments"]
+    assert [(s["mode"], s["from_block"], s["to_block"]) for s in segs] == [("politics_only", 100, 300)]

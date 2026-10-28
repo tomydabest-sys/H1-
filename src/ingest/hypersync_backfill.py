@@ -90,6 +90,25 @@ def save_checkpoint(sdir: Path, last_committed_block: int) -> None:
     os.replace(tmp, f)
 
 
+def upsert_retention_segment(
+    sdir: Path, run_id: str, mode: str, from_block: int, to_block: int
+) -> None:
+    """Create or extend this run's coverage segment. Called right after every
+    checkpoint save, so a SIGKILL (container restart) can never leave blocks
+    checkpointed but unrecorded — a `finally` block does not run on SIGKILL."""
+    f = sdir / "_retention.json"
+    doc = json.loads(f.read_text()) if f.exists() else {"segments": []}
+    seg = next((s for s in doc["segments"] if s.get("run_id") == run_id), None)
+    if seg is None:
+        seg = {"run_id": run_id, "mode": mode, "from_block": from_block}
+        doc["segments"].append(seg)
+    seg["to_block"] = to_block
+    seg["recorded_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    tmp = f.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(doc, indent=1))
+    os.replace(tmp, f)
+
+
 def append_retention_segment(sdir: Path, mode: str, from_block: int, to_block: int) -> None:
     """Record which block ranges hold full vs filtered raw (dataset definition)."""
     f = sdir / "_retention.json"
@@ -249,8 +268,10 @@ async def run_stream(
 
     query = _build_query(spec, start_block, end_inclusive + 1)
     batch = 0
-    # Record coverage even when the run dies mid-way (disk guard, crash,
-    # restart): the checkpoint has already advanced past those blocks.
+    mode = "full" if row_filter is None else "politics_only"
+    run_id = f"{start_block}@{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}"
+    # Coverage is recorded at every checkpoint (survives SIGKILL); the finally
+    # below is a belt-and-braces final write for clean exits and exceptions.
     try:
         while True:
             if shutil.disk_usage(sdir).free < MIN_FREE_BYTES:
@@ -270,6 +291,7 @@ async def run_stream(
                 result.events += len(rows)
             save_checkpoint(sdir, covered_to)
             result.last_committed_block = covered_to
+            upsert_retention_segment(sdir, run_id, mode, result.from_block, covered_to)
             batch += 1
             if log_every and batch % log_every == 0:
                 print(
@@ -284,11 +306,8 @@ async def run_stream(
             query.from_block = next_block
     finally:
         if result.last_committed_block >= result.from_block:
-            append_retention_segment(
-                sdir,
-                mode="full" if row_filter is None else "politics_only",
-                from_block=result.from_block,
-                to_block=result.last_committed_block,
+            upsert_retention_segment(
+                sdir, run_id, mode, result.from_block, result.last_committed_block
             )
     return result
 

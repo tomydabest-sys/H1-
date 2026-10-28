@@ -92,6 +92,7 @@ def test_retention_manifest_written(data_root):
             "from_block": 100,
             "to_block": 300,
             "recorded_at": doc["segments"][0]["recorded_at"],
+            "run_id": doc["segments"][0]["run_id"],  # per-run key for checkpoint-time upserts
         }
     ]
     # filter dropped everything: checkpoint advanced, no parts written

@@ -29,9 +29,12 @@ import re
 from pathlib import Path
 
 import polars as pl
+import pyarrow as pa
+import pyarrow.parquet as pq
 
-from ingest.contracts import STREAM_EXCHANGE_ADDRESS, STREAMS
+from ingest.contracts import CTF_TOPIC0, STREAM_EXCHANGE_ADDRESS, STREAMS
 from ingest.gamma_markets import latest_complete_snapshot
+from normalize.compact import iter_windows, raw_parts, stream_files
 from normalize import decode
 
 POLITICS_PATTERNS = re.compile(r"politic|election|geopolit", re.IGNORECASE)
@@ -40,19 +43,91 @@ TRADES_DEDUP_KEY = ["tx_hash", "log_index"]
 
 
 def _read_stream_raw(data_root: Path, stream: str) -> pl.DataFrame | None:
-    d = data_root / "raw" / "hypersync" / stream
-    parts = sorted(d.glob("part-*.parquet"))
-    if not parts:
+    files = stream_files(data_root, stream)
+    if not files:
         return None
-    return pl.read_parquet(parts)
+    return pl.read_parquet(files)
 
 
 def _scan_stream_raw(data_root: Path, stream: str) -> pl.LazyFrame | None:
-    d = data_root / "raw" / "hypersync" / stream
-    parts = sorted(d.glob("part-*.parquet"))
-    if not parts:
+    # Compacted chunks when they match the raw part set exactly (see compact.py).
+    files = stream_files(data_root, stream)
+    if not files:
         return None
-    return pl.scan_parquet(parts)
+    return pl.scan_parquet(files)
+
+
+# Raw data is ~280k small part files; polars opens them serially (~23ms each),
+# so full-dataset scans take hours. compact.iter_windows reads with a thread pool.
+_iter_windows = iter_windows
+
+
+def _parts_overlap(data_root: Path, stream: str) -> bool:
+    """Duplicate logs can only come from part files whose block ranges overlap
+    (a re-scan after a crash); without overlaps, per-window dedup is exact."""
+    rng = [tuple(int(x) for x in p.stem.split("-")[1:]) for p in raw_parts(data_root, stream)]
+    return any(rng[i][0] <= rng[i - 1][1] for i in range(1, len(rng)))
+
+
+def _read_ctf_metadata_events(data_root: Path) -> pl.DataFrame | None:
+    """Only ConditionPreparation/Resolution rows (the decoders filter by topic0
+    too); split/merge/redemption rows are never materialized."""
+    files = stream_files(data_root, "ctf_events")
+    if not files:
+        return None
+    keep = [CTF_TOPIC0["ConditionResolution"], CTF_TOPIC0["ConditionPreparation"]]
+    frames = [w.filter(pl.col("topic0").is_in(keep)) for w in _iter_windows(files)]
+    return pl.concat(frames, how="vertical")
+
+
+def _join_tokens(trades, tokens: pl.DataFrame):
+    sel = tokens.select(
+        "token_id_hex", "market_id", "condition_id", "is_politics",
+        "neg_risk", "outcome_index", "outcome_label",
+    )
+    return trades.join(
+        sel.lazy() if isinstance(trades, pl.LazyFrame) else sel, on="token_id_hex", how="left"
+    ).with_columns(
+        cohort=pl.when(pl.col("market_id").is_null())
+        .then(pl.lit("chain_only"))
+        .otherwise(pl.lit("matched")),
+        is_politics=pl.col("is_politics").fill_null(False),
+    )
+
+
+def write_trades_windowed(data_root: Path, tokens: pl.DataFrame, out_path: Path) -> int | None:
+    """Decode + dedup + join each OrderFilled stream window by window into one
+    Parquet file. Returns None (caller uses the global lazy path) if any
+    stream's part ranges overlap, since then duplicates may span windows."""
+    if any(
+        _parts_overlap(data_root, n) for n, s in STREAMS.items() if s.generation is not None
+    ):
+        return None
+    writer = None
+    n = 0
+    tmp = out_path.with_name(out_path.name + ".tmp")
+    try:
+        for name, spec in STREAMS.items():
+            if spec.generation is None:
+                continue
+            files = stream_files(data_root, name)
+            fn = decode.decode_order_filled_v1 if spec.generation == 1 else decode.decode_order_filled_v2
+            for raw in _iter_windows(files):
+                df = fn(raw, exchange=name, exchange_address=STREAM_EXCHANGE_ADDRESS[name])
+                df = _join_tokens(df.unique(subset=TRADES_DEDUP_KEY, keep="first"), tokens)
+                tbl = df.to_arrow()
+                if writer is None:
+                    writer = pq.ParquetWriter(tmp, tbl.schema, compression="zstd")
+                writer.write_table(tbl.cast(writer.schema))
+                n += tbl.num_rows
+            print(f"  decoded {name}: {n:,} trades so far", flush=True)
+    finally:
+        if writer is not None:
+            writer.close()
+    if writer is None:
+        return 0
+    tmp.replace(out_path)
+    return n
 
 
 def scan_all_trades(data_root: Path) -> pl.LazyFrame | None:
@@ -321,6 +396,78 @@ def build_daily_bars(trades_lf: pl.LazyFrame, out_path: Path) -> None:
     bars.sink_parquet(out_path)
 
 
+def _bar_aggs() -> list:
+    maker = ~pl.col("taker_is_exchange")
+    taker = pl.col("taker_is_exchange")
+    buy = pl.col("side") == "BUY"
+    return [
+        pl.col("market_id").drop_nulls().first().alias("market_id"),
+        pl.col("condition_id").drop_nulls().first().alias("condition_id"),
+        pl.col("is_politics").any().alias("is_politics"),
+        maker.sum().alias("n_fills"),
+        pl.col("usd_notional").filter(maker).sum().alias("usd_volume"),
+        pl.col("token_amount").filter(maker).sum().alias("token_volume"),
+        pl.col("collateral_amount").filter(maker).sum().alias("collateral_volume"),
+        pl.col("fee").filter(maker).sum().alias("fees"),
+        pl.col("usd_notional").filter(taker & buy).sum().alias("taker_buy_usd"),
+        pl.col("token_amount").filter(taker & buy).sum().alias("taker_buy_tokens"),
+        pl.col("usd_notional").filter(taker & ~buy).sum().alias("taker_sell_usd"),
+        pl.col("token_amount").filter(taker & ~buy).sum().alias("taker_sell_tokens"),
+    ]
+
+
+_SUMMED = ["n_fills", "usd_volume", "token_volume", "collateral_volume", "fees",
+           "taker_buy_usd", "taker_buy_tokens", "taker_sell_usd", "taker_sell_tokens"]
+
+
+def build_daily_bars_windowed(data_root: Path, tokens: pl.DataFrame, out_path: Path) -> int | None:
+    """Same bars as build_daily_bars, without a fill-level intermediate (which
+    would not fit on disk): per-window partial bars, then an exact merge. Sums
+    add, `any` ORs, and last_price is taken at the max (block, log_index).
+    Returns None if part ranges overlap (cross-window duplicates possible)."""
+    if any(
+        _parts_overlap(data_root, n) for n, s in STREAMS.items() if s.generation is not None
+    ):
+        return None
+    partials = []
+    for name, spec in STREAMS.items():
+        if spec.generation is None:
+            continue
+        fn = decode.decode_order_filled_v1 if spec.generation == 1 else decode.decode_order_filled_v2
+        for raw in _iter_windows(stream_files(data_root, name)):
+            df = fn(raw, exchange=name, exchange_address=STREAM_EXCHANGE_ADDRESS[name])
+            df = _join_tokens(df.unique(subset=TRADES_DEDUP_KEY, keep="first"), tokens)
+            partials.append(
+                df.with_columns(date=pl.from_epoch(pl.col("block_timestamp")).dt.date())
+                .sort("block_number", "log_index")
+                .group_by("token_id_hex", "date")
+                .agg(
+                    *_bar_aggs(),
+                    pl.col("price").last().alias("last_price"),
+                    pl.col("block_number").last().alias("_last_block"),
+                    pl.col("log_index").last().alias("_last_log"),
+                )
+            )
+        print(f"  bars partials after {name}: {sum(p.height for p in partials):,}", flush=True)
+    if not partials:
+        return 0
+    bars = (
+        pl.concat(partials, how="vertical")
+        .sort("_last_block", "_last_log")
+        .group_by("token_id_hex", "date")
+        .agg(
+            pl.col("market_id").drop_nulls().first(),
+            pl.col("condition_id").drop_nulls().first(),
+            pl.col("is_politics").any(),
+            *[pl.col(c).sum() for c in _SUMMED],
+            pl.col("last_price").last(),
+        )
+        .with_columns(vwap=pl.col("collateral_volume") / pl.col("token_volume"))
+    )
+    bars.write_parquet(out_path)
+    return bars.height
+
+
 def build(data_root: Path, write_trades: bool = True, write_daily_bars: bool = True) -> dict:
     """Build curated tables. `write_trades=False` skips the fill-level sink when
     it would not fit on disk (it stays rebuildable from raw at any time)."""
@@ -330,7 +477,7 @@ def build(data_root: Path, write_trades: bool = True, write_daily_bars: bool = T
     markets = load_markets(data_root)
     tokens = token_map(markets)
 
-    ctf_raw = _read_stream_raw(data_root, "ctf_events")
+    ctf_raw = _read_ctf_metadata_events(data_root)
     if ctf_raw is None or ctf_raw.is_empty():
         resolutions = pl.DataFrame()
         conditions = pl.DataFrame()
@@ -354,43 +501,65 @@ def build(data_root: Path, write_trades: bool = True, write_daily_bars: bool = T
 
     trades_path = curated / "trades.parquet"
     bars_path = curated / "daily_bars.parquet"
-    trades_lf = scan_all_trades(data_root)
     n_trades = 0
     n_chain_only = 0
     n_bars = 0
-    if trades_lf is None:
-        if write_trades:
-            pl.DataFrame(schema={c: pl.Utf8 for c in decode.TRADE_COLUMNS}).write_parquet(trades_path)
-    else:
-        joined = trades_lf.join(
-            tokens.select(
-                "token_id_hex", "market_id", "condition_id", "is_politics",
-                "neg_risk", "outcome_index", "outcome_label",
-            ).lazy(),
-            on="token_id_hex",
-            how="left",
-        ).with_columns(
-            cohort=pl.when(pl.col("market_id").is_null())
-            .then(pl.lit("chain_only"))
-            .otherwise(pl.lit("matched")),
-            is_politics=pl.col("is_politics").fill_null(False),
-        )
-        if write_trades:
-            # sink_parquet executes the whole decode+dedup+join as a streaming query
-            joined.sink_parquet(trades_path)
-            counts = (
-                pl.scan_parquet(trades_path)
-                .select(
-                    pl.len().alias("n"),
-                    (pl.col("cohort") == "chain_only").sum().alias("chain_only"),
+    if not write_trades and write_daily_bars:
+        n_windowed_bars = build_daily_bars_windowed(data_root, tokens, bars_path)
+        if n_windowed_bars is not None:
+            n_bars = n_windowed_bars
+            write_daily_bars = False  # done; skip the paths below
+    windowed_path = trades_path if write_trades else data_root / "interim" / "trades_for_bars.parquet"
+    windowed_path.parent.mkdir(parents=True, exist_ok=True)
+    n_windowed = (
+        write_trades_windowed(data_root, tokens, windowed_path)
+        if (write_trades or write_daily_bars)
+        else 0
+    )
+    if n_windowed is not None:
+        if n_windowed == 0:
+            if write_trades:
+                pl.DataFrame(schema={c: pl.Utf8 for c in decode.TRADE_COLUMNS}).write_parquet(trades_path)
+        else:
+            if write_trades:
+                counts = (
+                    pl.scan_parquet(trades_path)
+                    .select(
+                        pl.len().alias("n"),
+                        (pl.col("cohort") == "chain_only").sum().alias("chain_only"),
+                    )
+                    .collect()
                 )
-                .collect()
-            )
-            n_trades = int(counts["n"][0])
-            n_chain_only = int(counts["chain_only"][0])
-        if write_daily_bars:
-            build_daily_bars(joined, bars_path)
-            n_bars = int(pl.scan_parquet(bars_path).select(pl.len()).collect().item())
+                n_trades = int(counts["n"][0])
+                n_chain_only = int(counts["chain_only"][0])
+            if write_daily_bars:
+                build_daily_bars(pl.scan_parquet(windowed_path), bars_path)
+                n_bars = int(pl.scan_parquet(bars_path).select(pl.len()).collect().item())
+            if not write_trades:
+                windowed_path.unlink()
+    else:
+        trades_lf = scan_all_trades(data_root)
+        if trades_lf is None:
+            if write_trades:
+                pl.DataFrame(schema={c: pl.Utf8 for c in decode.TRADE_COLUMNS}).write_parquet(trades_path)
+        else:
+            joined = _join_tokens(trades_lf, tokens)
+            if write_trades:
+                # sink_parquet executes the whole decode+dedup+join as a streaming query
+                joined.sink_parquet(trades_path)
+                counts = (
+                    pl.scan_parquet(trades_path)
+                    .select(
+                        pl.len().alias("n"),
+                        (pl.col("cohort") == "chain_only").sum().alias("chain_only"),
+                    )
+                    .collect()
+                )
+                n_trades = int(counts["n"][0])
+                n_chain_only = int(counts["chain_only"][0])
+            if write_daily_bars:
+                build_daily_bars(joined, bars_path)
+                n_bars = int(pl.scan_parquet(bars_path).select(pl.len()).collect().item())
 
     markets.write_parquet(curated / "markets.parquet")
     # Small, git-persistable record of the politics set the raw filter used

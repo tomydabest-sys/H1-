@@ -203,3 +203,78 @@ def test_load_markets_falls_back_to_frozen_curated_tables(data_root):
     pl.concat([frozen, frozen.with_columns(market_id=pl.lit("2"), is_politics=pl.lit(False))]
               ).write_parquet(curated / "markets.parquet")
     assert load_markets(data_root).height == 2  # full table preferred
+
+
+def test_windowed_trades_dedup_and_overlap_fallback(data_root):
+    # Duplicates inside one part are collapsed per window; overlapping part
+    # ranges (duplicates may span windows) make the windowed path bow out.
+    from normalize.build_curated import token_map, write_trades_windowed
+
+    kw = dict(maker=MAKER, taker=TAKER, maker_asset_id=0, taker_asset_id=TOKEN_POLITICS_YES,
+              maker_amount=600_000, taker_amount=1_000_000)
+    write_raw_part(data_root, "orderfilled_ctf_v1",
+                   [v1_order_filled_row(**kw, log_index=1), v1_order_filled_row(**kw, log_index=1)],
+                   "part-0000000001-0000000099.parquet")
+    write_raw_part(data_root, "orderfilled_ctf_v1",
+                   [v1_order_filled_row(**kw, log_index=2, block_number=150, tx_hash="0x" + "ee" * 32)],
+                   "part-0000000100-0000000199.parquet")
+    write_gamma_snapshot(
+        data_root,
+        markets=[gamma_market(1, COND_POLITICS, [TOKEN_POLITICS_YES], event_id=11, closed=True)],
+        events=[gamma_event(11, ["us-politics"])],
+    )
+    from normalize.build_curated import load_markets
+
+    tokens = token_map(load_markets(data_root))
+    out = data_root / "t.parquet"
+    assert write_trades_windowed(data_root, tokens, out) == 2
+    got = pl.read_parquet(out)
+    assert got["market_id"].to_list() == ["1", "1"] and got["cohort"].unique().to_list() == ["matched"]
+
+    write_raw_part(data_root, "orderfilled_ctf_v1", [v1_order_filled_row(**kw, log_index=3)],
+                   "part-0000000150-0000000250.parquet")  # overlaps the previous part
+    assert write_trades_windowed(data_root, tokens, data_root / "t2.parquet") is None
+
+
+def test_windowed_bars_equal_reference_bars(data_root, monkeypatch):
+    # Exact equivalence with build_daily_bars when one token-day spans windows
+    # and streams (last_price must come from the latest block/log overall).
+    import functools
+
+    from normalize import build_curated as bc
+    from normalize.compact import iter_windows
+    from conftest import v2_order_filled_row
+
+    monkeypatch.setattr(bc, "_iter_windows", functools.partial(iter_windows, window=1))
+    day = 1_780_000_000
+    v1 = lambda blk, idx, mamt, tamt, taker=TAKER: v1_order_filled_row(
+        maker=MAKER, taker=taker, maker_asset_id=0, taker_asset_id=TOKEN_POLITICS_YES,
+        maker_amount=mamt, taker_amount=tamt, block_number=blk, block_timestamp=day + blk,
+        log_index=idx, tx_hash=f"0x{blk:064x}")
+    write_raw_part(data_root, "orderfilled_ctf_v1", [v1(10, 0, 600_000, 1_000_000), v1(10, 1, 300_000, 1_000_000)],
+                   "part-0000000001-0000000019.parquet")
+    write_raw_part(data_root, "orderfilled_ctf_v1",
+                   [v1(30, 0, 700_000, 1_000_000, taker="0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e")],
+                   "part-0000000020-0000000039.parquet")
+    write_raw_part(data_root, "orderfilled_ctf_v2",
+                   [v2_order_filled_row(maker=MAKER, taker=TAKER, side=0, token_id=TOKEN_POLITICS_YES,
+                                        maker_amount=550_000, taker_amount=1_000_000, block_number=20,
+                                        block_timestamp=day + 20, log_index=5)],
+                   "part-0000000001-0000000029.parquet")
+    write_gamma_snapshot(
+        data_root,
+        markets=[gamma_market(1, COND_POLITICS, [TOKEN_POLITICS_YES], event_id=11, closed=True)],
+        events=[gamma_event(11, ["us-politics"])],
+    )
+    tokens = bc.token_map(bc.load_markets(data_root))
+    got_n = bc.build_daily_bars_windowed(data_root, tokens, data_root / "w.parquet")
+    ref_path = data_root / "r.parquet"
+    bc.build_daily_bars(bc._join_tokens(bc.scan_all_trades(data_root), tokens), ref_path)
+    ref = pl.read_parquet(ref_path).sort("token_id_hex", "date")
+    got = pl.read_parquet(data_root / "w.parquet").select(ref.columns).sort("token_id_hex", "date")
+    assert got_n == ref.height
+    # Float sums differ in the last ulp with summation order (the reference
+    # group_by itself is order-nondeterministic), so compare with a tolerance.
+    from polars.testing import assert_frame_equal
+
+    assert_frame_equal(got, ref, rel_tol=1e-12)

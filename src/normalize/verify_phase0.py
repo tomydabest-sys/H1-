@@ -25,6 +25,7 @@ from pathlib import Path
 import polars as pl
 
 from ingest.contracts import MIGRATION_TS, PINNED_END_BLOCK, STREAMS
+from normalize.compact import iter_windows, stream_files
 
 COVERING_MODES = {"politics_only", "full"}
 REQUIRED_CURATED = ("markets.parquet", "resolutions.parquet", "daily_bars.parquet")
@@ -87,13 +88,13 @@ def report_streams(r: Report, data: Path, target_block: int) -> None:
     pre_total = post_total = 0
     for name, spec in STREAMS.items():
         sdir = data / "raw" / "hypersync" / name
-        parts = sorted(sdir.glob("part-*.parquet"))
+        parts = stream_files(data, name)  # compacted chunks if they match raw exactly
         ckpt_f = sdir / "_checkpoint.json"
         ckpt = int(json.loads(ckpt_f.read_text())["last_committed_block"]) if ckpt_f.exists() else None
         if not parts:
             r.fail(f"{name}: no data ingested")
         else:
-            df = pl.read_parquet(parts, columns=["block_number", "block_timestamp"])
+            df = pl.concat(list(iter_windows(parts, columns=["block_number", "block_timestamp"])))
             ts = df["block_timestamp"]
             pre = df.filter(pl.col("block_timestamp") < MIGRATION_TS).height
             post = df.height - pre

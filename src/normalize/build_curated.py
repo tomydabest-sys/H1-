@@ -24,6 +24,7 @@ matched-tag inventory are printed by scripts/verify_phase0.py for review.
 
 from __future__ import annotations
 
+import gc
 import json
 import re
 from pathlib import Path
@@ -519,23 +520,11 @@ def build(data_root: Path, write_trades: bool = True, write_daily_bars: bool = T
     tokens = token_map(
         markets.filter(pl.col("is_politics")) if _all_politics_only(data_root) else markets
     )
-
-    ctf_counts = write_ctf_metadata(data_root, curated)
-    resolved_ids = (
-        pl.read_parquet(curated / "resolutions.parquet", columns=["condition_id"])["condition_id"].unique()
-        if ctf_counts["resolutions"]
-        else pl.Series([""], dtype=pl.Utf8)
-    )
-    markets = markets.with_columns(
-        cohort=pl.when(
-            (pl.col("condition_id") != "")  # empty ids must never match the fallback
-            & pl.col("condition_id").is_in(resolved_ids.implode())
-        )
-        .then(pl.lit("resolved_onchain"))
-        .when(pl.col("closed"))
-        .then(pl.lit("closed_unresolved"))
-        .otherwise(pl.lit("open"))
-    )
+    # The full markets frame (~3.3GB resident) is not needed by the chain reads;
+    # holding it through them OOM-killed the build. It is reloaded (same inputs,
+    # nothing below writes them) for the cohort step at the end.
+    del markets
+    gc.collect()
 
     trades_path = curated / "trades.parquet"
     bars_path = curated / "daily_bars.parquet"
@@ -599,6 +588,22 @@ def build(data_root: Path, write_trades: bool = True, write_daily_bars: bool = T
                 build_daily_bars(joined, bars_path)
                 n_bars = int(pl.scan_parquet(bars_path).select(pl.len()).collect().item())
 
+    ctf_counts = write_ctf_metadata(data_root, curated)
+    resolved_ids = (
+        pl.read_parquet(curated / "resolutions.parquet", columns=["condition_id"])["condition_id"].unique()
+        if ctf_counts["resolutions"]
+        else pl.Series([""], dtype=pl.Utf8)
+    )
+    markets = load_markets(data_root).with_columns(
+        cohort=pl.when(
+            (pl.col("condition_id") != "")  # empty ids must never match the fallback
+            & pl.col("condition_id").is_in(resolved_ids.implode())
+        )
+        .then(pl.lit("resolved_onchain"))
+        .when(pl.col("closed"))
+        .then(pl.lit("closed_unresolved"))
+        .otherwise(pl.lit("open"))
+    )
     markets.write_parquet(curated / "markets.parquet")
     # Small, git-persistable record of the politics set the raw filter used
     # (full markets.parquet can exceed GitHub's 100MB file limit).

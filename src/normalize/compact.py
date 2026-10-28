@@ -52,14 +52,26 @@ def stream_files(data_root: Path, stream: str) -> list[Path]:
 
 
 def iter_windows(files: list[Path], columns: list[str] | None = None, window: int = 2000,
-                 workers: int = 16):
-    """Yield polars frames of `window` files each, read with a thread pool
-    (~280 files/s here vs ~40/s for polars' serial opens)."""
+                 workers: int = 16, max_bytes: int = 32 * 2**20, filters=None):
+    """Yield polars frames of up to `window` files and `max_bytes` of Parquet
+    each (always at least one file), read with a thread pool (~280 files/s here
+    vs ~40/s for polars' serial opens). Hex-string columns expand ~40x in
+    memory, so the byte cap is what bounds RSS: a 2000-file ctf_events window
+    was 9GB resident. `filters` (pyarrow DNF) drops rows per file before concat."""
     import polars as pl
 
+    groups: list[list[Path]] = []
+    size = 0
+    for f in files:
+        b = f.stat().st_size
+        if not groups or len(groups[-1]) >= window or size + b > max_bytes:
+            groups.append([])
+            size = 0
+        groups[-1].append(f)
+        size += b
     with ThreadPoolExecutor(workers) as ex:
-        for start in range(0, len(files), window):
-            tables = list(ex.map(lambda f: pq.read_table(f, columns=columns), files[start : start + window]))
+        for group in groups:
+            tables = list(ex.map(lambda f: pq.read_table(f, columns=columns, filters=filters), group))
             yield pl.from_arrow(pa.concat_tables(tables))
 
 

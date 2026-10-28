@@ -69,15 +69,40 @@ def _parts_overlap(data_root: Path, stream: str) -> bool:
     return any(rng[i][0] <= rng[i - 1][1] for i in range(1, len(rng)))
 
 
-def _read_ctf_metadata_events(data_root: Path) -> pl.DataFrame | None:
-    """Only ConditionPreparation/Resolution rows (the decoders filter by topic0
-    too); split/merge/redemption rows are never materialized."""
+def write_ctf_metadata(data_root: Path, curated: Path) -> dict[str, int]:
+    """Decode ConditionResolution/Preparation window by window straight into
+    curated/resolutions.parquet and conditions.parquet. These are kept in full
+    (not politics-filtered): ~9M rows, ~9GB if materialized as raw events at
+    once, which OOMs the build. Split/merge/redemption rows are dropped per
+    file before they reach a window."""
+    counts = {"resolutions": 0, "conditions": 0}
     files = stream_files(data_root, "ctf_events")
     if not files:
-        return None
+        return counts
     keep = [CTF_TOPIC0["ConditionResolution"], CTF_TOPIC0["ConditionPreparation"]]
-    frames = [w.filter(pl.col("topic0").is_in(keep)) for w in _iter_windows(files)]
-    return pl.concat(frames, how="vertical")
+    decoders = {
+        "resolutions": decode.decode_condition_resolutions,
+        "conditions": decode.decode_condition_preparations,
+    }
+    writers: dict[str, pq.ParquetWriter] = {}
+    tmp = {k: curated / f"{k}.parquet.tmp" for k in decoders}
+    try:
+        for raw in _iter_windows(files, filters=[("topic0", "in", keep)]):
+            for key, fn in decoders.items():
+                tbl = fn(raw).to_arrow()
+                if not tbl.num_rows:
+                    continue
+                if key not in writers:
+                    writers[key] = pq.ParquetWriter(tmp[key], tbl.schema, compression="zstd")
+                writers[key].write_table(tbl.cast(writers[key].schema))
+                counts[key] += tbl.num_rows
+    finally:
+        for w in writers.values():
+            w.close()
+    for key in writers:
+        tmp[key].replace(curated / f"{key}.parquet")
+    print(f"  ctf metadata: {counts}", flush=True)
+    return counts
 
 
 def _join_tokens(trades, tokens: pl.DataFrame):
@@ -495,21 +520,16 @@ def build(data_root: Path, write_trades: bool = True, write_daily_bars: bool = T
         markets.filter(pl.col("is_politics")) if _all_politics_only(data_root) else markets
     )
 
-    ctf_raw = _read_ctf_metadata_events(data_root)
-    if ctf_raw is None or ctf_raw.is_empty():
-        resolutions = pl.DataFrame()
-        conditions = pl.DataFrame()
-    else:
-        resolutions = decode.decode_condition_resolutions(ctf_raw)
-        conditions = decode.decode_condition_preparations(ctf_raw)
-
+    ctf_counts = write_ctf_metadata(data_root, curated)
     resolved_ids = (
-        set(resolutions["condition_id"].to_list()) if not resolutions.is_empty() else set()
+        pl.read_parquet(curated / "resolutions.parquet", columns=["condition_id"])["condition_id"].unique()
+        if ctf_counts["resolutions"]
+        else pl.Series([""], dtype=pl.Utf8)
     )
     markets = markets.with_columns(
         cohort=pl.when(
             (pl.col("condition_id") != "")  # empty ids must never match the fallback
-            & pl.col("condition_id").is_in(sorted(resolved_ids) or [""])
+            & pl.col("condition_id").is_in(resolved_ids.implode())
         )
         .then(pl.lit("resolved_onchain"))
         .when(pl.col("closed"))
@@ -583,17 +603,13 @@ def build(data_root: Path, write_trades: bool = True, write_daily_bars: bool = T
     # Small, git-persistable record of the politics set the raw filter used
     # (full markets.parquet can exceed GitHub's 100MB file limit).
     markets.filter(pl.col("is_politics")).write_parquet(curated / "politics_markets.parquet")
-    if not resolutions.is_empty():
-        resolutions.write_parquet(curated / "resolutions.parquet")
-    if not conditions.is_empty():
-        conditions.write_parquet(curated / "conditions.parquet")
 
     return {
         "trades": n_trades,
         "daily_bars": n_bars,
         "markets": markets.height,
-        "resolutions": resolutions.height if not resolutions.is_empty() else 0,
-        "conditions": conditions.height if not conditions.is_empty() else 0,
+        "resolutions": ctf_counts["resolutions"],
+        "conditions": ctf_counts["conditions"],
         "politics_markets": int(markets["is_politics"].sum()),
         "chain_only_trades": n_chain_only,
     }

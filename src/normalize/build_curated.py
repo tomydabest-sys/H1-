@@ -468,6 +468,17 @@ def build_daily_bars_windowed(data_root: Path, tokens: pl.DataFrame, out_path: P
     return bars.height
 
 
+def _all_politics_only(data_root: Path) -> bool:
+    modes = set()
+    for name, spec in STREAMS.items():
+        if spec.generation is None:
+            continue
+        f = data_root / "raw" / "hypersync" / name / "_retention.json"
+        if f.exists():
+            modes |= {seg["mode"] for seg in json.loads(f.read_text())["segments"]}
+    return modes == {"politics_only"}
+
+
 def build(data_root: Path, write_trades: bool = True, write_daily_bars: bool = True) -> dict:
     """Build curated tables. `write_trades=False` skips the fill-level sink when
     it would not fit on disk (it stays rebuildable from raw at any time)."""
@@ -475,7 +486,14 @@ def build(data_root: Path, write_trades: bool = True, write_daily_bars: bool = T
     curated.mkdir(parents=True, exist_ok=True)
 
     markets = load_markets(data_root)
-    tokens = token_map(markets)
+    # Raw OrderFilled rows are politics tokens by construction when every
+    # recorded retention segment is politics_only, so the join needs only
+    # politics tokens (the full 8.4M-token map costs ~4GB and OOMs a 16GB
+    # container alongside the chain reads). A non-politics fill would still
+    # surface, as cohort=chain_only, never silently.
+    tokens = token_map(
+        markets.filter(pl.col("is_politics")) if _all_politics_only(data_root) else markets
+    )
 
     ctf_raw = _read_ctf_metadata_events(data_root)
     if ctf_raw is None or ctf_raw.is_empty():

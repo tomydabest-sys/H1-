@@ -5,6 +5,12 @@
    "from_block": 84800347,
    "to_block": 84974262,
    "recorded_at": "2026-10-24T23:23:03Z"
+  },
+  {
+   "mode": "politics_only",
+   "from_block": 90170271,
+   "to_block": 95199593,
+   "recorded_at": "2026-10-28T16:35:02Z"
   }
  ]
 }

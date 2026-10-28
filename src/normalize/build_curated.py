@@ -463,7 +463,7 @@ def build_daily_bars_windowed(data_root: Path, tokens: pl.DataFrame, out_path: P
         for raw in _iter_windows(stream_files(data_root, name)):
             df = fn(raw, exchange=name, exchange_address=STREAM_EXCHANGE_ADDRESS[name])
             df = _join_tokens(df.unique(subset=TRADES_DEDUP_KEY, keep="first"), tokens)
-            partials.append(
+            partial = (
                 df.with_columns(date=pl.from_epoch(pl.col("block_timestamp")).dt.date())
                 .sort("block_number", "log_index")
                 .group_by("token_id_hex", "date")
@@ -474,6 +474,11 @@ def build_daily_bars_windowed(data_root: Path, tokens: pl.DataFrame, out_path: P
                     pl.col("log_index").last().alias("_last_log"),
                 )
             )
+            # Polars string views in the partial point into the whole window's
+            # string buffers, so keeping partials pinned every window (~75MB
+            # each; OOM-killed in negrisk_v1). A large_string round-trip copies
+            # out just the partial's strings.
+            partials.append(pl.from_arrow(partial.to_arrow(compat_level=pl.CompatLevel.oldest())))
         print(f"  bars partials after {name}: {sum(p.height for p in partials):,}", flush=True)
     if not partials:
         return 0
